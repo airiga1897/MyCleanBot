@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.poetry]
+package-mode = false
+
+[project]
+name = "mycleanbot"
+version = "0.1.0"
+description = "Multi-user Telegram self-filter managed by AI Service Platform"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+  "Django[argon2]>=5.2,<5.3",
+  "Telethon>=1.40,<2",
+  "cryptography>=45,<46",
+  "dj-database-url>=2.3,<3",
+  "django-csp>=4.0,<5",
+  "django-ratelimit>=4.1,<5",
+  "gunicorn>=23,<24",
+  "psycopg[binary]>=3.2,<4",
+  "qrcode[pil]>=8.2,<9",
+  "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+  "coverage[toml]>=7.8,<8",
+  "django-stubs>=5.2,<6",
+  "mypy>=1.16,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=1.0,<2",
+  "pytest-django>=4.11,<5",
+  "ruff>=0.12,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["config*", "core*"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+python_files = ["test_*.py"]
+addopts = "--strict-markers --strict-config"
+cache_dir = ".tmp/pytest-cache"
+norecursedirs = [".venv", ".tmp", "pytest-cache-files-*"]
+
+[tool.coverage.run]
+branch = true
+source = ["core"]
+omit = [
+  "core/migrations/*",
+  "core/tests/*",
+  "core/management/commands/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["core/migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "DJ"]
+
+[tool.mypy]
+python_version = "3.11"
+plugins = ["mypy_django_plugin.main"]
+strict = true
+exclude = ["^core/(migrations|tests)/", "^core/admin\\.py$"]
+
+[tool.django-stubs]
+django_settings_module = "config.settings"
+
+[[tool.mypy.overrides]]
+module = ["telethon.*", "qrcode.*", "django_ratelimit.*", "csp.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["core.views"]
+disallow_untyped_decorators = false

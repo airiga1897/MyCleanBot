@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card narrow">
+  <h1>Новое приглашение</h1>
+  <p>Ссылка действует 24 часа и показывается только один раз.</p>
+  <form method="post">
+    {% csrf_token %}
+    <button type="submit">Создать приглашение</button>
+  </form>
+  {% if invite_url %}
+    <label for="invite-url">Ссылка</label>
+    <input id="invite-url" value="{{ invite_url }}" readonly>
+  {% endif %}
+</section>
+{% endblock %}
+

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+
+  python:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mycleanbot
+          POSTGRES_USER: mycleanbot
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mycleanbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://mycleanbot:test-password@127.0.0.1:5432/mycleanbot
+      DJANGO_SECRET_KEY: ci-only-secret
+      DJANGO_DEBUG: "true"
+      MASTER_ENCRYPTION_KEY: 5CPIF3z9pGl0UeT0z4p06MPdwz0GTJVKjm-RxPwIRYE=
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install "poetry==2.4.1"
+      - run: poetry install --with dev --no-root
+      - run: poetry check
+      - run: poetry run ruff check .
+      - run: poetry run mypy config core
+      - run: poetry run python manage.py check --deploy
+      - run: poetry run python manage.py makemigrations --check --dry-run
+      - run: poetry run coverage run -m pytest
+      - run: poetry run coverage report
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [python, secret-scan]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: mycleanbot:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

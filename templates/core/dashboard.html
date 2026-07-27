@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Личный кабинет</h1>
+
+<section class="card">
+  <h2>Telegram</h2>
+  <p>Статус: <strong>{{ account.get_status_display }}</strong></p>
+  {% if account.last_heartbeat_at %}<p>Последний сигнал: {{ account.last_heartbeat_at }}</p>{% endif %}
+  <form method="get" action="{% url 'dashboard' %}">
+    <button type="submit">Проверить статус</button>
+  </form>
+  {% if not account.encrypted_session %}
+    <a class="button" href="{% url 'telegram_auth' %}">Подключить Telegram</a>
+  {% elif not pending_disconnect %}
+    <form method="post" action="{% url 'request_disconnect' %}">
+      {% csrf_token %}
+      <button class="danger" type="submit">Запросить отключение</button>
+    </form>
+  {% else %}
+    <p>Запрос на отключение ожидает администратора.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="row"><h2>Запрещённые фразы</h2><a class="button" href="{% url 'add_rule' %}">Добавить</a></div>
+  {% if rules %}
+    <table>
+      <thead><tr><th>Фраза</th><th>Создано</th><th>Действие</th></tr></thead>
+      <tbody>
+      {% for rule, phrase in rules %}
+        <tr>
+          <td>{{ phrase }}</td>
+          <td>{{ rule.created_at }}</td>
+          <td>
+            <form method="post" action="{% url 'request_rule_removal' rule.id %}">
+              {% csrf_token %}
+              <button type="submit">Запросить удаление</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}<p>Правил пока нет.</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>Последние события</h2>
+  <table>
+    <thead><tr><th>Время</th><th>Источник</th><th>Чат</th><th>Результат</th></tr></thead>
+    <tbody>
+      {% for event in events %}
+      <tr>
+        <td>{{ event.created_at }}</td>
+        <td>{{ event.source }}</td>
+        <td>{{ event.chat_type }}</td>
+        <td>{{ event.get_result_display }}</td>
+      </tr>
+      {% empty %}<tr><td colspan="4">Событий пока нет.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
+

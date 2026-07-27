@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card narrow">
+  <h1>Подключение Telegram</h1>
+  {% if not flow or flow.state == "failed" or flow.state == "expired" %}
+    <form method="post" action="{% url 'start_qr_auth' %}">
+      {% csrf_token %}
+      <button type="submit">Подключить по QR</button>
+    </form>
+    <a class="button secondary" href="{% url 'start_phone_auth' %}">Использовать телефон и код</a>
+  {% elif flow.state == "queued" %}
+    <p>Запрос ожидает worker. Обновите страницу через несколько секунд.</p>
+  {% elif flow.state == "qr_ready" %}
+    <p>Отсканируйте QR-код официальным приложением Telegram.</p>
+    <img class="qr" src="data:image/png;base64,{{ qr_data }}" alt="QR для Telegram">
+  {% elif flow.state == "code_required" or flow.state == "password_required" %}
+    <p>{% if flow.state == "code_required" %}Введите одноразовый код.{% else %}Введите пароль 2FA.{% endif %}</p>
+    <form method="post" action="{% url 'submit_auth_secret' %}">
+      {% csrf_token %}
+      {{ secret_form.as_p }}
+      <button type="submit">Продолжить</button>
+    </form>
+  {% elif flow.state == "complete" %}
+    <p>Telegram успешно подключён.</p>
+    <a class="button" href="{% url 'dashboard' %}">Вернуться</a>
+  {% endif %}
+  {% if flow.error_code %}<p class="warning">Ошибка: {{ flow.error_code }}</p>{% endif %}
+</section>
+{% endblock %}
+

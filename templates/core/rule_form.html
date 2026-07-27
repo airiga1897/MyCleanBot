@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card narrow">
+  <h1>Новое правило</h1>
+  <p class="warning">Правило включится сразу. Для удаления потребуется подтверждение администратора.</p>
+  <form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Добавить правило</button>
+  </form>
+</section>
+{% endblock %}
+

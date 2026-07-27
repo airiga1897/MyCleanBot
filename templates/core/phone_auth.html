@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card narrow">
+  <h1>Подключение по номеру</h1>
+  <form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Получить код</button>
+  </form>
+</section>
+{% endblock %}
+
