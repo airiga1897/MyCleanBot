@@ -38,7 +38,6 @@ jobs:
       DATABASE_URL: postgresql://mycleanbot:test-password@127.0.0.1:5432/mycleanbot
       DJANGO_SECRET_KEY: ci-only-secret
       DJANGO_DEBUG: "true"
-      MASTER_ENCRYPTION_KEY: 5CPIF3z9pGl0UeT0z4p06MPdwz0GTJVKjm-RxPwIRYE=
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,6 +46,11 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install "poetry==2.4.1"
       - run: poetry install --with dev --no-root
+      - name: Generate ephemeral encryption key
+        shell: bash
+        run: |
+          key="$(poetry run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+          echo "MASTER_ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
       - run: poetry check
       - run: poetry run ruff check .
       - run: poetry run mypy config core

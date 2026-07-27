@@ -1,0 +1,10 @@
+title = "MyCleanBot gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Retired CI-only Fernet key from the initial commit"
+condition = "AND"
+paths = ['''^\.github/workflows/ci\.yml$''']
+regexes = ['''5CPI[F]3z9pGl0UeT0z4p06MPdwz0GTJVKjm-RxPwIRYE=''']
