@@ -19,16 +19,30 @@ from django.utils import timezone
 from django.views.decorators.http import require_http_methods, require_POST
 from django_ratelimit.decorators import ratelimit
 
-from core.forms import AuthSecretForm, InviteRegistrationForm, PhoneAuthForm, RuleForm
+from core.forms import (
+    AuthSecretForm,
+    InviteRegistrationForm,
+    MiniAppPolicyForm,
+    MiniAppRuleForm,
+    PhoneAuthForm,
+    RuleForm,
+)
 from core.models import (
     DisconnectRequest,
     ForbiddenRule,
     Invitation,
+    MiniAppPolicy,
+    MiniAppRule,
     RuleRemovalRequest,
     TelegramAccount,
     TelegramAuthFlow,
 )
 from core.services.crypto import decrypt_for_user, encrypt_for_user
+from core.services.miniapps import (
+    DuplicateMiniAppRuleError,
+    create_mini_app_rule,
+    display_mini_app_rules,
+)
 from core.services.rules import DuplicateRuleError, create_rule, display_rules
 
 
@@ -112,6 +126,64 @@ def request_disconnect(request: HttpRequest) -> HttpResponse:
     DisconnectRequest.objects.get_or_create(user=user, status=DisconnectRequest.Status.PENDING)
     messages.success(request, "Запрос на отключение отправлен администратору.")
     return redirect("dashboard")
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def mini_app_settings(request: HttpRequest) -> HttpResponse:
+    user = _authenticated_user(request)
+    account, _ = TelegramAccount.objects.get_or_create(user=user)
+    policy, _ = MiniAppPolicy.objects.get_or_create(account=account)
+    policy_form = MiniAppPolicyForm(request.POST or None, instance=policy)
+    if request.method == "POST" and policy_form.is_valid():
+        policy_form.save()
+        messages.success(request, "Политика Mini Apps обновлена.")
+        return redirect("mini_app_settings")
+    return render(
+        request,
+        "core/mini_app_settings.html",
+        {
+            "account": account,
+            "policy": policy,
+            "policy_form": policy_form,
+            "rule_form": MiniAppRuleForm(),
+            "mini_app_rules": display_mini_app_rules(account),
+            "mini_app_events": account.mini_app_events.select_related("rule")[:100],
+        },
+    )
+
+
+@login_required
+@require_POST
+def add_mini_app_rule(request: HttpRequest) -> HttpResponse:
+    user = _authenticated_user(request)
+    account, _ = TelegramAccount.objects.get_or_create(user=user)
+    form = MiniAppRuleForm(request.POST)
+    if form.is_valid():
+        try:
+            create_mini_app_rule(
+                account,
+                form.cleaned_data["list_type"],
+                form.cleaned_data["match_type"],
+                form.cleaned_data["value"],
+            )
+        except DuplicateMiniAppRuleError:
+            messages.error(request, "Такое правило уже существует.")
+        else:
+            messages.success(request, "Правило Mini Apps добавлено.")
+    else:
+        messages.error(request, "Правило не добавлено: проверьте тип и значение.")
+    return redirect("mini_app_settings")
+
+
+@login_required
+@require_POST
+def delete_mini_app_rule(request: HttpRequest, rule_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    rule = get_object_or_404(MiniAppRule, pk=rule_id, account__user=user)
+    rule.delete()
+    messages.success(request, "Правило Mini Apps удалено.")
+    return redirect("mini_app_settings")
 
 
 @login_required

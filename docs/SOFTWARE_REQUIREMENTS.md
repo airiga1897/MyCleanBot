@@ -15,6 +15,8 @@
 - Tenant-owned querysets обязательны для пользовательских endpoints.
 - Phrase, MTProto session, phone, OTP и 2FA не логируются.
 - Phrase/session — envelope encrypted; transient auth secrets имеют TTL пять минут.
+- Mini App rules принадлежат конкретному `TelegramAccount`; текстовые значения шифруются.
+- Mini App audit не содержит полный текст сообщений, session или WebView content.
 - Пользователь может добавлять правило, но removal/disconnect требует operator approval.
 
 ## Тестирование
@@ -26,6 +28,8 @@
 - Минимум 95% coverage для matcher/deletion/security и 85% по `core`.
 - Обязательны negative tenant tests, auth lifecycle mocks, URL cases, retry behavior
   и проверка отсутствия sensitive logging.
+- MTProto Mini App operations тестируются только через mock client; CI не использует
+  реальные Telegram credentials или аккаунты.
 - CI использует временный PostgreSQL; production database не используется.
 
 ## Код
@@ -47,4 +51,3 @@
 - `/healthz` — database и worker readiness;
 - PostgreSQL heartbeat между web и worker;
 - `repository_dispatch` между product CI и platform CD.
-

@@ -24,6 +24,12 @@ Platform master key хранится отдельно от PostgreSQL backup. П
 - Auth input шифруется, живёт не более пяти минут и очищается после consumption.
 - URL никогда не запрашиваются по сети, что исключает SSRF через matcher.
 - AccountRunner защищён advisory lock от одновременного запуска в двух replicas.
+- Mini App allow/deny rules и audit events всегда привязаны к одному TelegramAccount.
+- Allow rule имеет приоритет над deny rule, чтобы снизить риск ошибочного ограничения.
+- Regex ограничены длиной и безопасным подмножеством без lookaround, backreference и
+  квантифицированных групп.
+- В Mini App audit сохраняются только account, rule, event type, bot id/username,
+  timestamp, result и короткий error code.
 
 ## Инциденты
 
@@ -36,4 +42,3 @@ Platform master key хранится отдельно от PostgreSQL backup. П
 
 Уязвимости не следует публиковать в открытом issue. Используйте private security
 advisory репозитория.
-

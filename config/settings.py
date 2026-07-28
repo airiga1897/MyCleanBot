@@ -118,7 +118,13 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_USE_IPV6 = False
 STATUS_MESSAGE_TTL_SECONDS = int(os.getenv("STATUS_MESSAGE_TTL_SECONDS", "15"))
 WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "10"))
+MINI_APP_RECONCILE_SECONDS = int(os.getenv("MINI_APP_RECONCILE_SECONDS", "300"))
 MAX_TELEGRAM_ACCOUNTS = int(os.getenv("MAX_TELEGRAM_ACCOUNTS", "10"))
+ADMINS = [
+    ("MyCleanBot operator", email.strip())
+    for email in os.getenv("MINI_APP_ADMIN_EMAILS", "").split(",")
+    if email.strip()
+]
 
 LOGGING = {
     "version": 1,

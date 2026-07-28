@@ -11,11 +11,15 @@ from django.utils import timezone
 from core.models import (
     DisconnectRequest,
     Invitation,
+    MiniAppAuditEvent,
+    MiniAppPolicy,
+    MiniAppRule,
     RuleRemovalRequest,
     TelegramAccount,
     TelegramAuthFlow,
 )
 from core.services.crypto import decrypt_for_user, encrypt_for_user
+from core.services.miniapps import create_mini_app_rule
 from core.services.rules import create_rule
 
 pytestmark = pytest.mark.django_db
@@ -112,6 +116,132 @@ def test_dashboard_only_contains_current_users_events_and_rules(client: Client) 
     body = client.get(reverse("dashboard")).content.decode()
     assert "visible phrase" in body
     assert "hidden phrase" not in body
+
+
+def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
+    owner = User.objects.create_user("mini-owner", password="long-password-123")
+    other = User.objects.create_user("mini-other", password="long-password-123")
+    owner_account = TelegramAccount.objects.create(user=owner)
+    other_account = TelegramAccount.objects.create(user=other)
+    owner_rule = create_mini_app_rule(
+        owner_account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.USERNAME,
+        "visible_bot",
+    )
+    create_mini_app_rule(
+        other_account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.USERNAME,
+        "hidden_bot",
+    )
+    MiniAppAuditEvent.objects.create(
+        account=other_account,
+        event_type=MiniAppAuditEvent.EventType.OUTGOING_DETECTED,
+        bot_username="hidden_audit_bot",
+        result=MiniAppAuditEvent.Result.OBSERVED,
+    )
+    client.force_login(owner)
+
+    body = client.get(reverse("mini_app_settings")).content.decode()
+    assert "visible_bot" in body
+    assert "hidden_bot" not in body
+    assert "hidden_audit_bot" not in body
+    response = client.post(
+        reverse("delete_mini_app_rule", kwargs={"rule_id": owner_rule.pk})
+    )
+    assert response.status_code == 302
+    assert not MiniAppRule.objects.filter(pk=owner_rule.pk).exists()
+
+
+def test_user_cannot_delete_another_accounts_mini_app_rule(client: Client) -> None:
+    owner = User.objects.create_user("mini-rule-owner", password="long-password-123")
+    attacker = User.objects.create_user("mini-rule-attacker", password="long-password-123")
+    owner_account = TelegramAccount.objects.create(user=owner)
+    TelegramAccount.objects.create(user=attacker)
+    rule = create_mini_app_rule(
+        owner_account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.BOT_ID,
+        "12345",
+    )
+    client.force_login(attacker)
+    response = client.post(reverse("delete_mini_app_rule", kwargs={"rule_id": rule.pk}))
+    assert response.status_code == 404
+    assert MiniAppRule.objects.filter(pk=rule.pk).exists()
+
+
+def test_mini_app_policy_defaults_to_observe_and_enforce_needs_confirmation(
+    client: Client,
+) -> None:
+    user = User.objects.create_user("mini-policy-owner", password="long-password-123")
+    account = TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+
+    page = client.get(reverse("mini_app_settings"))
+    policy = MiniAppPolicy.objects.get(account=account)
+    assert page.status_code == 200
+    assert policy.mode == MiniAppPolicy.Mode.OBSERVE
+
+    response = client.post(
+        reverse("mini_app_settings"),
+        {
+            "mode": MiniAppPolicy.Mode.ENFORCE,
+            "block_bot": "on",
+            "notify_user": "on",
+        },
+    )
+    assert response.status_code == 200
+    policy.refresh_from_db()
+    assert policy.mode == MiniAppPolicy.Mode.OBSERVE
+
+    response = client.post(
+        reverse("mini_app_settings"),
+        {
+            "mode": MiniAppPolicy.Mode.ENFORCE,
+            "block_bot": "on",
+            "notify_user": "on",
+            "confirm_enforce": "on",
+        },
+    )
+    assert response.status_code == 302
+    policy.refresh_from_db()
+    assert policy.mode == MiniAppPolicy.Mode.ENFORCE
+
+
+def test_add_mini_app_rule_validates_regex(client: Client) -> None:
+    user = User.objects.create_user("mini-regex-owner", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+    response = client.post(
+        reverse("add_mini_app_rule"),
+        {
+            "list_type": MiniAppRule.ListType.DENY,
+            "match_type": MiniAppRule.MatchType.REGEX,
+            "value": "(a+)+",
+        },
+    )
+    assert response.status_code == 302
+    assert not MiniAppRule.objects.exists()
+
+
+def test_warn_policy_requires_a_configured_notification_channel(
+    client: Client, settings: object
+) -> None:
+    user = User.objects.create_user("mini-warn-owner", password="long-password-123")
+    account = TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+
+    response = client.post(
+        reverse("mini_app_settings"),
+        {
+            "mode": MiniAppPolicy.Mode.WARN,
+            "notify_admin": "on",
+        },
+    )
+    assert response.status_code == 200
+    assert "MINI_APP_ADMIN_EMAILS" in response.content.decode()
+    assert MiniAppPolicy.objects.get(account=account).mode == MiniAppPolicy.Mode.OBSERVE
 
 
 def test_qr_and_phone_auth_views(client: Client) -> None:
