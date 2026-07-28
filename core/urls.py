@@ -12,6 +12,13 @@ urlpatterns = [
         name="request_rule_removal",
     ),
     path("account/disconnect-request/", views.request_disconnect, name="request_disconnect"),
+    path("mini-apps/", views.mini_app_settings, name="mini_app_settings"),
+    path("mini-apps/rules/add/", views.add_mini_app_rule, name="add_mini_app_rule"),
+    path(
+        "mini-apps/rules/<int:rule_id>/delete/",
+        views.delete_mini_app_rule,
+        name="delete_mini_app_rule",
+    ),
     path("telegram/auth/", views.telegram_auth, name="telegram_auth"),
     path("telegram/auth/qr/", views.start_qr_auth, name="start_qr_auth"),
     path("telegram/auth/phone/", views.start_phone_auth, name="start_phone_auth"),

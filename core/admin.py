@@ -8,6 +8,9 @@ from core.models import (
     FilterEvent,
     ForbiddenRule,
     Invitation,
+    MiniAppAuditEvent,
+    MiniAppPolicy,
+    MiniAppRule,
     RuleRemovalRequest,
     TelegramAccount,
     TelegramAuthFlow,
@@ -147,6 +150,59 @@ class FilterEventAdmin(admin.ModelAdmin):
         "rule_ids",
         "source",
         "chat_type",
+        "result",
+        "error_code",
+        "created_at",
+    )
+
+    def has_add_permission(self, request: object) -> bool:
+        return False
+
+
+@admin.register(MiniAppPolicy)
+class MiniAppPolicyAdmin(admin.ModelAdmin):
+    list_display = ("account", "mode", "block_bot", "notify_user", "notify_admin", "updated_at")
+    readonly_fields = ("account", "mode", "block_bot", "notify_user", "notify_admin", "updated_at")
+
+    def has_add_permission(self, request: object) -> bool:
+        return False
+
+
+@admin.register(MiniAppRule)
+class MiniAppRuleAdmin(admin.ModelAdmin):
+    list_display = ("id", "account", "list_type", "match_type", "bot_id", "active", "created_at")
+    readonly_fields = (
+        "account",
+        "list_type",
+        "match_type",
+        "bot_id",
+        "active",
+        "created_at",
+    )
+    exclude = ("encrypted_pattern", "pattern_fingerprint")
+
+    def has_add_permission(self, request: object) -> bool:
+        return False
+
+
+@admin.register(MiniAppAuditEvent)
+class MiniAppAuditEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "account",
+        "rule_id",
+        "event_type",
+        "bot_id",
+        "bot_username",
+        "result",
+        "created_at",
+    )
+    readonly_fields = (
+        "account",
+        "rule",
+        "event_type",
+        "bot_id",
+        "bot_username",
         "result",
         "error_code",
         "created_at",

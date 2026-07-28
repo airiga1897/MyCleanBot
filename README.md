@@ -17,6 +17,8 @@ MyCleanBot — закрытый многопользовательский се�
 - индивидуальное envelope encryption правил и MTProto-сессий;
 - добавление правил пользователем, удаление и disconnect только после approval;
 - Django Admin для оператора и изолированный пользовательский кабинет;
+- индивидуальные allow/deny-политики для attachment/side-menu Mini Apps;
+- режимы Mini Apps `observe`, `warn` и `enforce` (по умолчанию `observe`);
 - platform-owned PostgreSQL и GitHub Actions CI/CD.
 
 ## Локальный запуск
@@ -52,3 +54,4 @@ Poetry создаёт изолированное окружение непоср
 - [Требования](docs/SOFTWARE_REQUIREMENTS.md)
 - [Безопасность](docs/SECURITY.md)
 - [CI/CD](docs/CI_CD.md)
+- [Ограничение Telegram Mini Apps](docs/MINI_APPS.md)

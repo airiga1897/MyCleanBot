@@ -66,10 +66,19 @@ button,
 .notice { padding: .8rem; border-left: 4px solid #3dbb79; background: #192820; }
 
 input,
-textarea {
+textarea,
+select {
   box-sizing: border-box;
   width: 100%;
   padding: .6rem;
+}
+
+input[type="checkbox"] {
+  width: auto;
+}
+
+.warning-box {
+  border-color: #9d7729;
 }
 
 table {
@@ -88,4 +97,3 @@ td {
   width: 280px;
   max-width: 100%;
 }
-

@@ -143,6 +143,101 @@ class FilterEvent(models.Model):
         return f"Filter event #{self.pk}"
 
 
+class MiniAppPolicy(models.Model):
+    class Mode(models.TextChoices):
+        OBSERVE = "observe", "Наблюдение"
+        WARN = "warn", "Предупреждение"
+        ENFORCE = "enforce", "Ограничение"
+
+    account = models.OneToOneField(
+        TelegramAccount, on_delete=models.CASCADE, related_name="mini_app_policy"
+    )
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.OBSERVE)
+    block_bot = models.BooleanField(default=False)
+    notify_user = models.BooleanField(default=True)
+    notify_admin = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"Mini App policy for account #{self.account_id}"
+
+
+class MiniAppRule(models.Model):
+    class ListType(models.TextChoices):
+        ALLOW = "allow", "Белый список"
+        DENY = "deny", "Чёрный список"
+
+    class MatchType(models.TextChoices):
+        BOT_ID = "bot_id", "Bot ID"
+        USERNAME = "username", "Username бота"
+        TITLE = "title", "Название Mini App"
+        KEYWORD = "keyword", "Ключевое слово"
+        REGEX = "regex", "Регулярное выражение"
+
+    account = models.ForeignKey(
+        TelegramAccount, on_delete=models.CASCADE, related_name="mini_app_rules"
+    )
+    list_type = models.CharField(max_length=8, choices=ListType.choices)
+    match_type = models.CharField(max_length=16, choices=MatchType.choices)
+    bot_id = models.BigIntegerField(null=True, blank=True)
+    encrypted_pattern = models.TextField(blank=True)
+    pattern_fingerprint = models.CharField(max_length=64)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["account", "list_type", "match_type", "pattern_fingerprint"],
+                name="unique_account_mini_app_rule",
+            )
+        ]
+        ordering = ["list_type", "match_type", "-created_at"]
+
+    def __str__(self) -> str:
+        return f"Mini App rule #{self.pk}"
+
+
+class MiniAppAuditEvent(models.Model):
+    class EventType(models.TextChoices):
+        MENU_DETECTED = "menu_detected", "Mini App обнаружено в меню"
+        OUTGOING_DETECTED = "outgoing_detected", "Исходящее сообщение обнаружено"
+        MENU_DISABLED = "menu_disabled", "Mini App отключено в меню"
+        BOT_BLOCKED = "bot_blocked", "Бот заблокирован"
+        MESSAGE_DELETED = "message_deleted", "Сообщение удалено"
+        USER_WARNED = "user_warned", "Пользователь предупреждён"
+        ADMIN_NOTIFIED = "admin_notified", "Администратор уведомлён"
+
+    class Result(models.TextChoices):
+        OBSERVED = "observed", "Обнаружено"
+        WARNED = "warned", "Предупреждено"
+        SUCCEEDED = "succeeded", "Выполнено"
+        FAILED = "failed", "Ошибка"
+        SKIPPED = "skipped", "Пропущено"
+
+    account = models.ForeignKey(
+        TelegramAccount, on_delete=models.CASCADE, related_name="mini_app_events"
+    )
+    rule = models.ForeignKey(
+        MiniAppRule, on_delete=models.SET_NULL, null=True, blank=True, related_name="events"
+    )
+    event_type = models.CharField(max_length=32, choices=EventType.choices)
+    bot_id = models.BigIntegerField(null=True, blank=True)
+    bot_username = models.CharField(max_length=64, blank=True)
+    result = models.CharField(max_length=16, choices=Result.choices)
+    error_code = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["account", "-created_at"], name="miniapp_event_account_time")
+        ]
+
+    def __str__(self) -> str:
+        return f"Mini App audit event #{self.pk}"
+
+
 class WorkerHeartbeat(models.Model):
     name = models.CharField(max_length=64, unique=True)
     updated_at = models.DateTimeField(auto_now=True)

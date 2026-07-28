@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Mini Apps — MyCleanBot{% endblock %}
+{% block content %}
+<div class="row">
+  <h1>Ограничение Telegram Mini Apps</h1>
+  <a class="button secondary" href="{% url 'dashboard' %}">Назад</a>
+</div>
+
+<section class="card warning-box">
+  <h2>Границы возможностей</h2>
+  <ul>
+    <li>MyCleanBot не может запретить ввод текста в официальном Telegram-клиенте.</li>
+    <li>Inline-результаты могут появиться до отправки сообщения.</li>
+    <li>Исходящее сообщение обрабатывается только после Telegram update.</li>
+    <li>Текст и действия внутри стороннего Mini App WebView недоступны MyCleanBot.</li>
+    <li>Приложение нельзя полностью скрыть из глобального поиска или каталога Telegram.</li>
+    <li>Абсолютная блокировка требует собственного Telegram-клиента или MDM.</li>
+  </ul>
+</section>
+
+<section class="card">
+  <h2>Политика аккаунта</h2>
+  <p>Безопасный режим по умолчанию — <strong>наблюдение</strong>. Белый список имеет
+    приоритет над чёрным.</p>
+  <form method="post">
+    {% csrf_token %}
+    {{ policy_form.as_p }}
+    <button type="submit">Сохранить политику</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Добавить правило</h2>
+  <p>Основной устойчивый идентификатор — Bot ID. Username и название могут измениться.</p>
+  <form method="post" action="{% url 'add_mini_app_rule' %}">
+    {% csrf_token %}
+    {{ rule_form.as_p }}
+    <button type="submit">Добавить</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Правила этого Telegram-аккаунта</h2>
+  <table>
+    <thead>
+      <tr><th>Список</th><th>Тип</th><th>Значение</th><th>Действие</th></tr>
+    </thead>
+    <tbody>
+      {% for rule, value in mini_app_rules %}
+      <tr>
+        <td>{{ rule.get_list_type_display }}</td>
+        <td>{{ rule.get_match_type_display }}</td>
+        <td>{{ value }}</td>
+        <td>
+          <form method="post" action="{% url 'delete_mini_app_rule' rule.id %}">
+            {% csrf_token %}
+            <button class="danger" type="submit">Удалить</button>
+          </form>
+        </td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="4">Правил пока нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>Журнал Mini Apps</h2>
+  <p>Текст сообщений, Telegram session и содержимое WebView здесь не сохраняются.</p>
+  <table>
+    <thead>
+      <tr><th>Время</th><th>Событие</th><th>Правило</th><th>Bot ID / username</th><th>Результат</th></tr>
+    </thead>
+    <tbody>
+      {% for event in mini_app_events %}
+      <tr>
+        <td>{{ event.created_at }}</td>
+        <td>{{ event.get_event_type_display }}</td>
+        <td>{% if event.rule_id %}#{{ event.rule_id }}{% else %}—{% endif %}</td>
+        <td>{% if event.bot_id %}{{ event.bot_id }}{% endif %}{% if event.bot_username %} @{{ event.bot_username }}{% endif %}</td>
+        <td>{{ event.get_result_display }}</td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="5">Событий пока нет.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
