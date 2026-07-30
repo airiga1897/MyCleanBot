@@ -40,6 +40,8 @@ from core.models import (
     Invitation,
     MiniAppPolicy,
     MiniAppRule,
+    OperatorNotification,
+    RuleChangeRequest,
     RuleRemovalRequest,
     TelegramAccount,
     TelegramAuthFlow,
@@ -51,7 +53,16 @@ from core.services.miniapps import (
     create_mini_app_rule,
     display_mini_app_rules,
 )
-from core.services.rules import DuplicateRuleError, create_rule
+from core.services.rules import (
+    DuplicateRuleError,
+    PendingRuleChangeError,
+    create_rule,
+    queue_history_scan,
+    resolve_rule_change,
+    rule_form_initial,
+    rule_label,
+    update_rule,
+)
 
 
 def _authenticated_user(request: HttpRequest) -> User:
@@ -62,8 +73,20 @@ def _authenticated_user(request: HttpRequest) -> User:
 def dashboard(request: HttpRequest) -> HttpResponse:
     user = _authenticated_user(request)
     account, _ = TelegramAccount.objects.get_or_create(user=user)
-    rules = user.forbidden_rules.all()
+    rules = user.forbidden_rules.prefetch_related(
+        "patterns", "dialog_scopes", "history_scans"
+    ).all()
     rules_page = Paginator(rules, 20).get_page(request.GET.get("page"))
+    rule_rows = [
+        {
+            "rule": rule,
+            "label": rule_label(rule),
+            "pattern_count": rule.patterns.count() or 1,
+            "scope_count": rule.dialog_scopes.count(),
+            "scan": rule.history_scans.first(),
+        }
+        for rule in rules_page.object_list
+    ]
     pending_rule_requests = {
         item.rule_id: item.pk
         for item in user.rule_removal_requests.filter(
@@ -97,9 +120,14 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         {
             "account": account,
             "rules_page": rules_page,
+            "rule_rows": rule_rows,
             "pending_rule_ids": set(pending_rule_requests),
+            "pending_rule_change_ids": set(
+                user.rule_change_requests.filter(
+                    status=RuleChangeRequest.Status.PENDING
+                ).values_list("rule_id", flat=True)
+            ),
             "history_scan": history_scan,
-            "history_scan_require_preview": settings.HISTORY_SCAN_REQUIRE_PREVIEW,
             "can_start_history_scan": bool(account.encrypted_session)
             and (
                 history_scan is None
@@ -138,6 +166,10 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
         failed=Count("id", filter=Q(result=FilterEvent.Result.FAILED)),
     )
     history_scan = account.history_scans.first()
+    rule_scans: dict[int, HistoryScan] = {}
+    for scan in account.history_scans.filter(rule_id__isnull=False):
+        if scan.rule_id is not None:
+            rule_scans.setdefault(scan.rule_id, scan)
     return JsonResponse(
         {
             "account": {
@@ -169,6 +201,17 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
                 if history_scan
                 else None
             ),
+            "rule_scans": {
+                str(rule_id): {
+                    "status": scan.get_status_display(),
+                    "status_code": scan.status,
+                    "messages_scanned": scan.messages_scanned,
+                    "matches_found": scan.matches_found,
+                    "deleted_self": scan.deleted_self,
+                    "failed_actions": scan.failed_actions,
+                }
+                for rule_id, scan in rule_scans.items()
+            },
             "events": [
                 {
                     "created_at": event.created_at.isoformat(),
@@ -209,22 +252,103 @@ def register_invite(request: HttpRequest, token: str) -> HttpResponse:
 @require_http_methods(["GET", "POST"])
 def add_rule(request: HttpRequest) -> HttpResponse:
     user = _authenticated_user(request)
-    form = RuleForm(request.POST or None)
+    form = RuleForm(request.POST or None, user=user)
     if request.method == "POST" and form.is_valid():
         try:
             create_rule(
                 user,
-                form.cleaned_data["phrase"],
+                form.cleaned_data["phrases"],
+                label=form.cleaned_data["label"],
                 direction=form.cleaned_data["direction"],
                 mode=form.cleaned_data["mode"],
                 is_locked=form.cleaned_data["is_locked"],
+                dialog_ids=[
+                    item.pk for item in form.cleaned_data["dialogs"]
+                ],
+                queue_history=True,
             )
         except DuplicateRuleError:
-            form.add_error("phrase", "Такое правило уже существует.")
+            form.add_error("phrases", "Такое правило уже существует.")
         else:
             messages.success(request, "Правило добавлено и сразу активно.")
             return redirect("dashboard")
-    return render(request, "core/rule_form.html", {"form": form})
+    response = render(
+        request,
+        "core/rule_form.html",
+        {"form": form, "heading": "Новое правило", "submit_label": "Сохранить и применить"},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def edit_rule(request: HttpRequest, rule_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    rule = get_object_or_404(
+        ForbiddenRule.objects.prefetch_related("patterns", "dialog_scopes"),
+        pk=rule_id,
+        user=user,
+    )
+    form = RuleForm(
+        request.POST or None,
+        user=user,
+        initial=rule_form_initial(rule),
+    )
+    if request.method == "POST" and form.is_valid():
+        try:
+            _rule, change = update_rule(
+                rule,
+                label=form.cleaned_data["label"],
+                phrases=form.cleaned_data["phrases"],
+                direction=form.cleaned_data["direction"],
+                mode=form.cleaned_data["mode"],
+                is_locked=form.cleaned_data["is_locked"],
+                dialog_ids=[item.pk for item in form.cleaned_data["dialogs"]],
+            )
+        except PendingRuleChangeError:
+            form.add_error(None, "Сначала отмените или дождитесь решения по текущему запросу.")
+        else:
+            if change:
+                messages.success(
+                    request,
+                    "Ослабление защищённого правила отправлено оператору. "
+                    "Текущая версия продолжает действовать.",
+                )
+            else:
+                messages.success(
+                    request,
+                    "Правило сохранено. Фоновая очистка его области поставлена в очередь.",
+                )
+            return redirect("dashboard")
+    response = render(
+        request,
+        "core/rule_form.html",
+        {
+            "form": form,
+            "heading": f"Редактирование правила #{rule.pk}",
+            "submit_label": "Сохранить и применить",
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@login_required
+@require_POST
+def cancel_rule_change(request: HttpRequest, rule_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    change = get_object_or_404(
+        RuleChangeRequest,
+        rule_id=rule_id,
+        user=user,
+        status=RuleChangeRequest.Status.PENDING,
+    )
+    change.status = RuleChangeRequest.Status.CANCELLED
+    change.resolved_at = timezone.now()
+    change.save(update_fields=["status", "resolved_at"])
+    messages.success(request, "Запрос на изменение правила отменён.")
+    return redirect("dashboard")
 
 
 @login_required
@@ -283,12 +407,7 @@ def start_history_scan(request: HttpRequest) -> HttpResponse:
     if active:
         messages.error(request, "Проверка истории уже выполняется.")
         return redirect("dashboard")
-    phase = (
-        HistoryScan.Phase.PREVIEW
-        if settings.HISTORY_SCAN_REQUIRE_PREVIEW
-        else HistoryScan.Phase.ENFORCE
-    )
-    HistoryScan.objects.create(account=account, phase=phase)
+    HistoryScan.objects.create(account=account, phase=HistoryScan.Phase.ENFORCE)
     messages.success(request, "Полная проверка истории поставлена в очередь.")
     return redirect("dashboard")
 
@@ -353,8 +472,14 @@ def cancel_history_scan(request: HttpRequest, scan_id: int) -> HttpResponse:
 @require_POST
 def reveal_rule(request: HttpRequest, rule_id: int) -> JsonResponse:
     user = _authenticated_user(request)
-    rule = get_object_or_404(ForbiddenRule, pk=rule_id, user=user)
-    response = JsonResponse({"phrase": decrypt_for_user(user, rule.encrypted_phrase)})
+    rule = get_object_or_404(
+        ForbiddenRule.objects.prefetch_related("patterns"), pk=rule_id, user=user
+    )
+    patterns = list(rule.patterns.all())
+    phrases = [
+        decrypt_for_user(user, item.encrypted_phrase) for item in patterns
+    ] or [decrypt_for_user(user, rule.encrypted_phrase)]
+    response = JsonResponse({"phrase": "\n".join(phrases), "phrases": phrases})
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -363,15 +488,35 @@ def reveal_rule(request: HttpRequest, rule_id: int) -> JsonResponse:
 @require_POST
 def test_rule(request: HttpRequest, rule_id: int) -> JsonResponse:
     user = _authenticated_user(request)
-    rule = get_object_or_404(ForbiddenRule, pk=rule_id, user=user)
+    rule = get_object_or_404(
+        ForbiddenRule.objects.prefetch_related("patterns"), pk=rule_id, user=user
+    )
     form = RuleTestForm(request.POST)
     if not form.is_valid():
         return JsonResponse({"error": "Некорректный тестовый текст."}, status=400)
-    phrase = normalize_text(decrypt_for_user(user, rule.encrypted_phrase))
-    matched = phrase in normalize_text(form.cleaned_data["text"])
+    patterns = list(rule.patterns.all())
+    phrases = [
+        normalize_text(decrypt_for_user(user, item.encrypted_phrase))
+        for item in patterns
+    ] or [normalize_text(decrypt_for_user(user, rule.encrypted_phrase))]
+    normalized_text = normalize_text(form.cleaned_data["text"])
+    matched = any(phrase in normalized_text for phrase in phrases)
     response = JsonResponse({"matched": matched})
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@login_required
+@require_POST
+def rerun_rule_history(request: HttpRequest, rule_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    rule = get_object_or_404(ForbiddenRule, pk=rule_id, user=user, active=True)
+    if rule.mode != ForbiddenRule.Mode.ENFORCE:
+        messages.error(request, "Очистка истории доступна только для режима удаления.")
+        return redirect("dashboard")
+    queue_history_scan(rule)
+    messages.success(request, "Повторная очистка истории поставлена в очередь.")
+    return redirect("dashboard")
 
 
 @login_required
@@ -559,9 +704,9 @@ def cancel_telegram_auth(request: HttpRequest) -> HttpResponse:
 @staff_member_required
 def operator_dashboard(request: HttpRequest) -> HttpResponse:
     now = timezone.now()
-    users = User.objects.filter(is_active=True).select_related("telegram_account").order_by(
-        "username"
-    )
+    users = User.objects.select_related(
+        "telegram_account", "invitation"
+    ).order_by("username")
     invitations = Invitation.objects.select_related("created_by", "consumed_by").order_by(
         "-created_at"
     )[:50]
@@ -570,7 +715,11 @@ def operator_dashboard(request: HttpRequest) -> HttpResponse:
         revoked_at__isnull=True,
         expires_at__gt=now,
     ).count()
-    occupied = users.count()
+    occupied = users.filter(is_active=True).count()
+    notifications = list(
+        OperatorNotification.objects.filter(processed_at__isnull=True)
+        .select_related("account__user", "rule")[:50]
+    )
     return render(
         request,
         "core/operator_dashboard.html",
@@ -584,6 +733,13 @@ def operator_dashboard(request: HttpRequest) -> HttpResponse:
             "rule_requests": RuleRemovalRequest.objects.filter(
                 status=RuleRemovalRequest.Status.PENDING
             ).select_related("user", "rule"),
+            "rule_change_requests": RuleChangeRequest.objects.filter(
+                status=RuleChangeRequest.Status.PENDING
+            ).select_related("user", "rule"),
+            "operator_notifications": notifications,
+            "operator_notification_ids": ",".join(
+                str(item.pk) for item in notifications
+            ),
             "disconnect_requests": DisconnectRequest.objects.filter(
                 status=DisconnectRequest.Status.PENDING
             ).select_related("user"),
@@ -598,6 +754,7 @@ def operator_dashboard(request: HttpRequest) -> HttpResponse:
 def create_invitation(request: HttpRequest) -> HttpResponse:
     user = _authenticated_user(request)
     invite_url = ""
+    invitation_id: int | None = None
     if request.method == "POST":
         now = timezone.now()
         occupied = len(
@@ -615,11 +772,16 @@ def create_invitation(request: HttpRequest) -> HttpResponse:
         if occupied + reserved >= settings.MAX_TELEGRAM_ACCOUNTS:
             messages.error(request, "Свободных мест и приглашений нет.")
         else:
-            _invitation, token = Invitation.issue(user)
+            invitation, token = Invitation.issue(user)
+            invitation_id = invitation.pk
             invite_url = request.build_absolute_uri(
                 reverse("register_invite", kwargs={"token": token})
             )
-    return render(request, "core/create_invitation.html", {"invite_url": invite_url})
+    return render(
+        request,
+        "core/create_invitation.html",
+        {"invite_url": invite_url, "invitation_id": invitation_id},
+    )
 
 
 @staff_member_required
@@ -633,7 +795,94 @@ def revoke_invitation(request: HttpRequest, invitation_id: int) -> HttpResponse:
     if invitation.revoked_at is None:
         invitation.revoked_at = timezone.now()
         invitation.save(update_fields=["revoked_at"])
-    messages.success(request, "Приглашение отозвано.")
+    messages.success(
+        request,
+        f"Приглашение #{invitation_id} отозвано. "
+        "Выполните отдельную платформенную команду revoke VPN.",
+    )
+    return redirect("operator_dashboard")
+
+
+@staff_member_required
+@require_POST
+def resolve_rule_change_request(
+    request: HttpRequest, request_id: int, decision: str
+) -> HttpResponse:
+    change = get_object_or_404(
+        RuleChangeRequest,
+        pk=request_id,
+        status=RuleChangeRequest.Status.PENDING,
+    )
+    if decision not in {"approve", "reject"}:
+        raise Http404
+    resolve_rule_change(
+        change, _authenticated_user(request), decision == "approve"
+    )
+    messages.success(request, "Запрос изменения правила обработан.")
+    return redirect("operator_dashboard")
+
+
+@staff_member_required
+@require_POST
+def process_operator_notification(
+    request: HttpRequest, notification_id: int
+) -> HttpResponse:
+    notification = get_object_or_404(
+        OperatorNotification, pk=notification_id, processed_at__isnull=True
+    )
+    notification.processed_at = timezone.now()
+    notification.processed_by = _authenticated_user(request)
+    notification.save(update_fields=["processed_at", "processed_by"])
+    return redirect("operator_dashboard")
+
+
+@staff_member_required
+@require_POST
+def process_visible_notifications(request: HttpRequest) -> HttpResponse:
+    raw_ids = request.POST.get("notification_ids", "")
+    ids = [int(value) for value in raw_ids.split(",") if value.isdigit()][:50]
+    OperatorNotification.objects.filter(
+        pk__in=ids, processed_at__isnull=True
+    ).update(
+        processed_at=timezone.now(),
+        processed_by=_authenticated_user(request),
+    )
+    messages.success(request, "Видимые оповещения отмечены обработанными.")
+    return redirect("operator_dashboard")
+
+
+@staff_member_required
+@require_POST
+@transaction.atomic
+def block_user(request: HttpRequest, user_id: int) -> HttpResponse:
+    user = get_object_or_404(
+        User.objects.select_for_update(), pk=user_id, is_staff=False
+    )
+    user.is_active = False
+    user.save(update_fields=["is_active"])
+    TelegramAccount.objects.filter(user=user).update(desired_enabled=False)
+    user.telegram_auth_flows.exclude(
+        state__in=[
+            TelegramAuthFlow.State.COMPLETE,
+            TelegramAuthFlow.State.FAILED,
+            TelegramAuthFlow.State.EXPIRED,
+            TelegramAuthFlow.State.CANCELLED,
+        ]
+    ).update(
+        state=TelegramAuthFlow.State.CANCELLED,
+        encrypted_payload="",
+        updated_at=timezone.now(),
+    )
+    HistoryScan.objects.filter(
+        account__user=user,
+        status__in=[HistoryScan.Status.QUEUED, HistoryScan.Status.RUNNING],
+    ).update(cancel_requested=True)
+    invitation_id = getattr(getattr(user, "invitation", None), "pk", None)
+    suffix = f" для Invitation ID {invitation_id}" if invitation_id else ""
+    messages.success(
+        request,
+        f"Пользователь заблокирован. Выполните отдельную платформенную команду revoke VPN{suffix}.",
+    )
     return redirect("operator_dashboard")
 
 

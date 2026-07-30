@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="card narrow">
-  <h1>Новое правило</h1>
-  <p class="warning">Правило включится сразу. Защищённое правило сможет удалить только оператор.</p>
+  <h1>{{ heading }}</h1>
+  <p class="warning">Фразы срабатывают по логике «ИЛИ». Для режима удаления после сохранения автоматически запускается фоновая очистка выбранных чатов.</p>
   <form method="post">
     {% csrf_token %}
     {{ form.as_p }}
-    <button type="submit">Добавить правило</button>
+    <button type="submit">{{ submit_label }}</button>
   </form>
 </section>
 {% endblock %}

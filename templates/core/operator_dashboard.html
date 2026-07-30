@@ -24,7 +24,7 @@
   <h2>Пользователи</h2>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>Логин</th><th>Роль</th><th>Telegram</th><th>Последний сигнал</th></tr></thead>
+      <thead><tr><th>Логин</th><th>Роль</th><th>Telegram</th><th>Последний сигнал</th><th>Доступ</th></tr></thead>
       <tbody>
       {% for item in users %}
         <tr>
@@ -32,6 +32,15 @@
           <td>{% if item.is_staff %}оператор{% else %}пользователь{% endif %}</td>
           <td>{{ item.telegram_account.get_status_display|default:"не подключён" }}</td>
           <td>{{ item.telegram_account.last_heartbeat_at|default:"—" }}</td>
+          <td>
+            {% if item.is_active %}активен{% else %}заблокирован{% endif %}
+            {% if item.invitation %} · Invitation #{{ item.invitation.id }}{% endif %}
+            {% if item.is_active and not item.is_staff %}
+              <form method="post" action="{% url 'block_user' item.id %}">
+                {% csrf_token %}<button class="danger" type="submit">Заблокировать</button>
+              </form>
+            {% endif %}
+          </td>
         </tr>
       {% endfor %}
       </tbody>
@@ -43,10 +52,11 @@
   <h2>Приглашения</h2>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>Создано</th><th>Действует до</th><th>Состояние</th><th>Действие</th></tr></thead>
+      <thead><tr><th>ID</th><th>Создано</th><th>Действует до</th><th>Состояние</th><th>Действие</th></tr></thead>
       <tbody>
       {% for invitation in invitations %}
         <tr>
+          <td>#{{ invitation.id }}</td>
           <td>{{ invitation.created_at }}</td>
           <td>{{ invitation.expires_at }}</td>
           <td>
@@ -67,6 +77,59 @@
       </tbody>
     </table>
   </div>
+</section>
+
+<section class="card">
+  <div class="row wrap">
+    <h2>Оповещения</h2>
+    {% if operator_notifications %}
+      <form method="post" action="{% url 'process_visible_notifications' %}">
+        {% csrf_token %}
+        <input type="hidden" name="notification_ids" value="{{ operator_notification_ids }}">
+        <button class="secondary" type="submit">Закрыть все видимые</button>
+      </form>
+    {% endif %}
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Пользователь</th><th>Первое / последнее</th><th>Событие</th><th>Правило</th><th>Bot ID / username</th><th>Результат</th><th>Повторы</th><th></th></tr></thead>
+      <tbody>
+      {% for item in operator_notifications %}
+        <tr>
+          <td>{{ item.account.user.username }}</td>
+          <td>{{ item.first_seen_at }}<br>{{ item.last_seen_at }}</td>
+                <td>{{ item.get_event_type_display }}</td>
+          <td>{% if item.rule_id %}#{{ item.rule_id }}{% else %}—{% endif %}</td>
+          <td>{% if item.bot_id %}{{ item.bot_id }}{% endif %}{% if item.bot_username %} @{{ item.bot_username }}{% endif %}</td>
+                <td>{{ item.get_result_display }}</td>
+          <td>{{ item.repeat_count }}</td>
+          <td>
+            <form method="post" action="{% url 'process_operator_notification' item.id %}">
+              {% csrf_token %}<button type="submit">Отметить обработанным</button>
+            </form>
+          </td>
+        </tr>
+      {% empty %}<tr><td colspan="8">Непрочитанных оповещений нет.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Изменения защищённых правил</h2>
+  {% for item in rule_change_requests %}
+    <div class="request-row">
+      <span>{{ item.user.username }} · правило #{{ item.rule_id }} · {{ item.change_summary }} · {{ item.created_at }}</span>
+      <div class="actions">
+        <form method="post" action="{% url 'resolve_rule_change_request' item.id 'approve' %}">
+          {% csrf_token %}<button type="submit">Одобрить</button>
+        </form>
+        <form method="post" action="{% url 'resolve_rule_change_request' item.id 'reject' %}">
+          {% csrf_token %}<button class="secondary" type="submit">Отклонить</button>
+        </form>
+      </div>
+    </div>
+  {% empty %}<p>Ожидающих изменений нет.</p>{% endfor %}
 </section>
 
 <section class="card">

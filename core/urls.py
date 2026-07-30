@@ -7,6 +7,17 @@ urlpatterns = [
     path("dashboard/status/", views.dashboard_status, name="dashboard_status"),
     path("invite/<str:token>/", views.register_invite, name="register_invite"),
     path("rules/add/", views.add_rule, name="add_rule"),
+    path("rules/<int:rule_id>/edit/", views.edit_rule, name="edit_rule"),
+    path(
+        "rules/<int:rule_id>/change-request/cancel/",
+        views.cancel_rule_change,
+        name="cancel_rule_change",
+    ),
+    path(
+        "rules/<int:rule_id>/history/rerun/",
+        views.rerun_rule_history,
+        name="rerun_rule_history",
+    ),
     path(
         "rules/<int:rule_id>/remove-request/",
         views.request_rule_removal,
@@ -54,6 +65,26 @@ urlpatterns = [
         "operator/rule-removals/<int:request_id>/<str:decision>/",
         views.resolve_rule_removal,
         name="resolve_rule_removal",
+    ),
+    path(
+        "operator/rule-changes/<int:request_id>/<str:decision>/",
+        views.resolve_rule_change_request,
+        name="resolve_rule_change_request",
+    ),
+    path(
+        "operator/notifications/<int:notification_id>/process/",
+        views.process_operator_notification,
+        name="process_operator_notification",
+    ),
+    path(
+        "operator/notifications/process-visible/",
+        views.process_visible_notifications,
+        name="process_visible_notifications",
+    ),
+    path(
+        "operator/users/<int:user_id>/block/",
+        views.block_user,
+        name="block_user",
     ),
     path(
         "operator/disconnects/<int:request_id>/<str:decision>/",

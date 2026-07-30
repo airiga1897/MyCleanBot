@@ -10,8 +10,7 @@ from typing import Any, cast
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.core.mail import send_mail
-from django.db import IntegrityError, close_old_connections, connection
+from django.db import IntegrityError, close_old_connections, connection, transaction
 from django.utils import timezone
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, SessionPasswordNeededError
@@ -24,8 +23,10 @@ from core.models import (
     HistoryScan,
     MiniAppAuditEvent,
     MiniAppPolicy,
+    OperatorNotification,
     TelegramAccount,
     TelegramAuthFlow,
+    TelegramDialog,
     WorkerHeartbeat,
 )
 from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
@@ -38,7 +39,7 @@ from core.services.miniapps import (
     extract_bot_usernames,
     load_mini_app_rules,
 )
-from core.services.rules import decrypted_rules
+from core.services.rules import RuleSpec, decrypted_rules, peer_fingerprint
 
 logger = logging.getLogger(__name__)
 MINI_APP_WARNING_PREFIX = "⚠️ MyCleanBot:"
@@ -75,7 +76,7 @@ def _release_account_lock(account_id: int) -> None:
 @sync_to_async
 def _account_snapshot() -> list[dict[str, Any]]:
     values = (
-        TelegramAccount.objects.filter(desired_enabled=True)
+        TelegramAccount.objects.filter(desired_enabled=True, user__is_active=True)
         .exclude(encrypted_session="")
         .values("id", "user_id", "encrypted_session")
     )
@@ -109,7 +110,7 @@ def _load_user(user_id: int) -> User:
 
 
 @sync_to_async
-def _load_rules(user: User, direction: str) -> list[tuple[int, str, str]]:
+def _load_rules(user: User, direction: str) -> list[RuleSpec]:
     return decrypted_rules(user, direction)
 
 
@@ -154,15 +155,38 @@ def _record_account_update(account_id: int, direction: str, result: str) -> None
 
 
 @sync_to_async
-def _claim_history_scan(account_id: int) -> dict[str, Any] | None:
-    scan = (
-        HistoryScan.objects.filter(
-            account_id=account_id,
-            status__in=[HistoryScan.Status.QUEUED, HistoryScan.Status.RUNNING],
+@transaction.atomic
+def _sync_dialog_catalog(account_id: int, entries: list[dict[str, Any]]) -> None:
+    account = TelegramAccount.objects.select_related("user").get(pk=account_id)
+    now = timezone.now()
+    seen: set[str] = set()
+    for entry in entries:
+        dialog_key = peer_fingerprint(account_id, int(entry["peer_id"]))
+        seen.add(dialog_key)
+        TelegramDialog.objects.update_or_create(
+            account=account,
+            peer_fingerprint=dialog_key,
+            defaults={
+                "encrypted_label": encrypt_for_user(
+                    account.user, str(entry["label"])[:256]
+                ),
+                "kind": str(entry["kind"]),
+                "available": True,
+                "last_seen_at": now,
+            },
         )
-        .order_by("created_at")
-        .first()
-    )
+    TelegramDialog.objects.filter(account=account).exclude(
+        peer_fingerprint__in=seen
+    ).update(available=False)
+
+
+@sync_to_async(thread_sensitive=True)
+@transaction.atomic
+def _claim_history_scan(account_id: int) -> dict[str, Any] | None:
+    scans = HistoryScan.objects.select_for_update().filter(account_id=account_id)
+    scan = scans.filter(status=HistoryScan.Status.RUNNING).first()
+    if scan is None:
+        scan = scans.filter(status=HistoryScan.Status.QUEUED).order_by("created_at").first()
     if scan is None:
         return None
     if scan.status == HistoryScan.Status.QUEUED:
@@ -175,6 +199,8 @@ def _claim_history_scan(account_id: int) -> dict[str, Any] | None:
     return {
         "id": scan.pk,
         "phase": scan.phase,
+        "rule_id": scan.rule_id,
+        "rule_revision": scan.rule_revision,
         "dialogs_scanned": scan.dialogs_scanned,
         "message_offset_id": scan.message_offset_id,
         "messages_scanned": scan.messages_scanned,
@@ -250,7 +276,7 @@ def _load_mini_app_state(
             "mode": policy.mode,
             "block_bot": policy.block_bot,
             "notify_user": policy.notify_user,
-            "notify_admin": policy.notify_admin,
+            "notify_operator": policy.notify_operator,
         },
         load_mini_app_rules(account),
     )
@@ -279,28 +305,43 @@ def _record_mini_app_event(
 
 
 @sync_to_async
-def _notify_mini_app_admin(
+@transaction.atomic
+def _notify_mini_app_operator(
     account_id: int,
     rule_id: int | None,
     event_type: str,
     bot_id: int | None,
     bot_username: str,
+    result: str,
 ) -> bool:
-    recipients = [email for _name, email in settings.ADMINS]
-    if not recipients:
-        return False
-    return bool(
-        send_mail(
-            "MyCleanBot: Mini App policy event",
-            (
-                f"account={account_id} rule={rule_id or '-'} event={event_type} "
-                f"bot_id={bot_id or '-'} username={bot_username or '-'}"
-            ),
-            settings.SERVER_EMAIL,
-            recipients,
-            fail_silently=True,
-        )
+    now = timezone.now()
+    username = bot_username[:64].casefold()
+    dedup_key = fingerprint(
+        f"operator-miniapp:{account_id}:{rule_id or 0}:{event_type}:"
+        f"{bot_id or 0}:{username}:{result}"
     )
+    notification = (
+        OperatorNotification.objects.select_for_update()
+        .filter(dedup_key=dedup_key, processed_at__isnull=True)
+        .first()
+    )
+    if notification is None:
+        OperatorNotification.objects.create(
+            account_id=account_id,
+            rule_id=rule_id,
+            event_type=event_type,
+            bot_id=bot_id,
+            bot_username=username,
+            result=result,
+            dedup_key=dedup_key,
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+    else:
+        notification.last_seen_at = now
+        notification.repeat_count += 1
+        notification.save(update_fields=["last_seen_at", "repeat_count"])
+    return True
 
 
 @sync_to_async
@@ -322,6 +363,25 @@ def _chat_type(event: Any, own_id: int) -> str:
     return "group"
 
 
+def _rule_specs(items: list[Any]) -> list[RuleSpec]:
+    specs: list[RuleSpec] = []
+    for item in items:
+        if isinstance(item, RuleSpec):
+            specs.append(item)
+        else:
+            rule_id, phrase, mode = item
+            specs.append(
+                RuleSpec(
+                    id=int(rule_id),
+                    phrases=(str(phrase),),
+                    mode=str(mode),
+                    revision=1,
+                    dialog_fingerprints=None,
+                )
+            )
+    return specs
+
+
 class AccountRunner:
     def __init__(self, account: dict[str, Any]) -> None:
         self.account = account
@@ -332,6 +392,7 @@ class AccountRunner:
         self.revoke_on_stop = False
         self.mini_app_reconcile_lock = asyncio.Lock()
         self.next_mini_app_reconcile_at = 0.0
+        self.next_dialog_sync_at = 0.0
         self.warned_mini_app_bot_ids: set[int] = set()
         self.history_scan_task: asyncio.Task[None] | None = None
 
@@ -400,6 +461,7 @@ class AccountRunner:
         await _set_account_state(int(self.account["id"]), TelegramAccount.Status.ACTIVE)
         while self.client.is_connected():
             await _set_account_state(int(self.account["id"]), TelegramAccount.Status.ACTIVE)
+            await self._maybe_sync_dialogs()
             await self._sync_history_scan()
             await self._maybe_reconcile_mini_apps()
             try:
@@ -409,6 +471,41 @@ class AccountRunner:
                 )
             except TimeoutError:
                 continue
+
+    async def _maybe_sync_dialogs(self) -> None:
+        if not self.client:
+            return
+        now = asyncio.get_running_loop().time()
+        if now < self.next_dialog_sync_at:
+            return
+        self.next_dialog_sync_at = now + settings.TELEGRAM_DIALOG_SYNC_SECONDS
+        entries: list[dict[str, Any]] = []
+        try:
+            async for dialog in self.client.iter_dialogs():
+                kind = self._history_chat_type(dialog)
+                entries.append(
+                    {
+                        "peer_id": int(getattr(dialog, "id", 0)),
+                        "label": (
+                            "Избранное"
+                            if kind == TelegramDialog.Kind.SAVED
+                            else str(
+                                getattr(dialog, "name", "")
+                                or f"Диалог {len(entries) + 1}"
+                            )
+                        ),
+                        "kind": kind,
+                    }
+                )
+            await _sync_dialog_catalog(int(self.account["id"]), entries)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "telegram_dialog_sync_failed account_id=%s error=%s",
+                self.account["id"],
+                exc.__class__.__name__,
+            )
 
     async def _sync_history_scan(self) -> None:
         if self.history_scan_task is not None:
@@ -455,13 +552,28 @@ class AccountRunner:
         skipped_global = int(scan["skipped_global"])
         failed_actions = int(scan["failed_actions"])
         rules_by_direction = {
-            FilterEvent.Direction.INCOMING: await _load_rules(
-                self.user, FilterEvent.Direction.INCOMING
+            FilterEvent.Direction.INCOMING: _rule_specs(
+                await _load_rules(self.user, FilterEvent.Direction.INCOMING)
             ),
-            FilterEvent.Direction.OUTGOING: await _load_rules(
-                self.user, FilterEvent.Direction.OUTGOING
+            FilterEvent.Direction.OUTGOING: _rule_specs(
+                await _load_rules(self.user, FilterEvent.Direction.OUTGOING)
             ),
         }
+        target_rule_id = int(scan.get("rule_id") or 0)
+        target_revision = int(scan.get("rule_revision") or 0)
+        if target_rule_id:
+            current = next(
+                (
+                    item
+                    for items in rules_by_direction.values()
+                    for item in items
+                    if item.id == target_rule_id and item.revision == target_revision
+                ),
+                None,
+            )
+            if current is None:
+                await _finish_history_scan(scan_id, HistoryScan.Status.CANCELLED)
+                return
         batch_count = 0
         dialog_index = 0
         async for dialog in self.client.iter_dialogs():
@@ -470,6 +582,9 @@ class AccountRunner:
                 continue
             current_offset = message_offset_id if dialog_index == dialog_cursor else 0
             chat_type = self._history_chat_type(dialog)
+            dialog_fingerprint = peer_fingerprint(
+                int(self.account["id"]), int(getattr(dialog, "id", 0))
+            )
             async for message in self.client.iter_messages(
                 dialog.input_entity,
                 offset_id=current_offset,
@@ -495,11 +610,23 @@ class AccountRunner:
                             )
                             for item in candidates
                         ]
-                    rules = rules_by_direction[direction]
-                    modes = {rule_id: mode for rule_id, _phrase, mode in rules}
+                    rules = [
+                        rule
+                        for rule in rules_by_direction[direction]
+                        if (not target_rule_id or rule.id == target_rule_id)
+                        and (
+                            rule.dialog_fingerprints is None
+                            or dialog_fingerprint in rule.dialog_fingerprints
+                        )
+                    ]
+                    modes = {rule.id: rule.mode for rule in rules}
                     matched = find_matches(
                         candidates,
-                        [(rule_id, phrase) for rule_id, phrase, _mode in rules],
+                        [
+                            (rule.id, phrase)
+                            for rule in rules
+                            for phrase in rule.phrases
+                        ],
                     )
                     if matched:
                         matches_found += 1
@@ -610,11 +737,19 @@ class AccountRunner:
                 TextCandidate("caption" if item.source == "body" else item.source, item.value)
                 for item in candidates
             ]
-        rules = await _load_rules(self.user, direction)
-        rule_modes = {rule_id: mode for rule_id, _phrase, mode in rules}
+        chat_fingerprint = peer_fingerprint(
+            int(self.account["id"]), int(event.chat_id or 0)
+        )
+        rules = [
+            rule
+            for rule in _rule_specs(await _load_rules(self.user, direction))
+            if rule.dialog_fingerprints is None
+            or chat_fingerprint in rule.dialog_fingerprints
+        ]
+        rule_modes = {rule.id: rule.mode for rule in rules}
         matches = find_matches(
             candidates,
-            [(rule_id, phrase) for rule_id, phrase, _mode in rules],
+            [(rule.id, phrase) for rule in rules for phrase in rule.phrases],
         )
         if not matches:
             await _record_account_update(int(self.account["id"]), direction, "no_match")
@@ -938,25 +1073,14 @@ class AccountRunner:
             await self._notify_user(decision, target)
             if target.bot_id is not None:
                 self.warned_mini_app_bot_ids.add(target.bot_id)
-        if policy["notify_admin"]:
-            notified = await _notify_mini_app_admin(
+        if policy["notify_operator"]:
+            await _notify_mini_app_operator(
                 int(self.account["id"]),
                 decision.rule.id,
                 event_type,
                 target.bot_id,
                 target.username,
-            )
-            await _record_mini_app_event(
-                int(self.account["id"]),
-                decision.rule.id,
-                MiniAppAuditEvent.EventType.ADMIN_NOTIFIED,
-                (
-                    MiniAppAuditEvent.Result.SUCCEEDED
-                    if notified
-                    else MiniAppAuditEvent.Result.SKIPPED
-                ),
-                bot_id=target.bot_id,
-                bot_username=target.username,
+                result,
             )
 
     async def _notify_user(

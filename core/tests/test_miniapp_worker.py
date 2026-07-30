@@ -13,6 +13,7 @@ from core.models import (
     MiniAppAuditEvent,
     MiniAppPolicy,
     MiniAppRule,
+    OperatorNotification,
     TelegramAccount,
 )
 from core.services import telegram_worker as worker
@@ -244,18 +245,31 @@ async def test_user_notification_failure_is_audited_without_message_text() -> No
     assert audit.error_code == "ConnectionError"
 
 
-async def test_admin_notification_configuration_and_reconcile_error(
-    settings: Any,
+async def test_operator_notification_deduplicates_and_reconcile_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings.ADMINS = []
-    assert not await worker._notify_mini_app_admin(1, 2, "test", 3, "bot")
+    account, _policy = await _account_with_rule(MiniAppPolicy.Mode.OBSERVE)
+    rule = await account.mini_app_rules.aget()
+    for _repeat in range(2):
+        assert await worker._notify_mini_app_operator(
+            account.pk,
+            rule.pk,
+            MiniAppAuditEvent.EventType.MENU_DETECTED,
+            3,
+            "bot",
+            MiniAppAuditEvent.Result.OBSERVED,
+        )
+    notification = await OperatorNotification.objects.aget(account=account)
+    assert notification.repeat_count == 2
+    assert notification.bot_username == "bot"
 
-    settings.ADMINS = [("Operator", "operator@example.test")]
-    monkeypatch.setattr(worker, "send_mail", lambda *_args, **_kwargs: 1)
-    assert await worker._notify_mini_app_admin(1, 2, "test", 3, "bot")
-
-    runner = worker.AccountRunner({"id": 1, "user_id": 1, "encrypted_session": "unused"})
+    runner = worker.AccountRunner(
+        {
+            "id": account.pk,
+            "user_id": account.user_id,
+            "encrypted_session": "unused",
+        }
+    )
     runner.client = MockTelegramApi()
 
     async def fail_reconcile() -> None:

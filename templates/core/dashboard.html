@@ -50,18 +50,31 @@
   </div>
   {% if rules_page %}
     <div class="rule-list">
-      {% for rule in rules_page %}
+      {% for row in rule_rows %}
+        {% with rule=row.rule %}
         <article class="rule-item">
           <div>
-            <strong>Правило #{{ rule.id }}</strong>
+            <strong>{{ row.label }}</strong>
             <span class="masked" id="rule-phrase-{{ rule.id }}">••••••••</span>
             <div class="meta">
               {{ rule.get_direction_display }} · {{ rule.get_mode_display }} ·
               {% if rule.is_locked %}защищено{% else %}обычное{% endif %} ·
-              {{ rule.created_at }}
+              {{ row.pattern_count }} фраз ·
+              {% if row.scope_count %}{{ row.scope_count }} чатов{% else %}все чаты{% endif %} ·
+              версия {{ rule.revision }}
             </div>
+            {% if row.scan %}
+              <div class="meta" id="rule-history-{{ rule.id }}">
+                История: <span data-field="status">{{ row.scan.get_status_display }}</span> ·
+                <span data-field="messages_scanned">{{ row.scan.messages_scanned }}</span> сообщений ·
+                <span data-field="matches_found">{{ row.scan.matches_found }}</span> совпадений ·
+                <span data-field="deleted_self">{{ row.scan.deleted_self }}</span> удалено ·
+                <span data-field="failed_actions">{{ row.scan.failed_actions }}</span> ошибок
+              </div>
+            {% endif %}
           </div>
           <div class="actions wrap">
+            <a class="button secondary" href="{% url 'edit_rule' rule.id %}">Редактировать</a>
             <button class="secondary js-reveal-rule" type="button"
                     data-url="{% url 'reveal_rule' rule.id %}"
                     data-target="rule-phrase-{{ rule.id }}">Показать</button>
@@ -75,6 +88,18 @@
                 <span class="test-result" aria-live="polite"></span>
               </form>
             </details>
+            {% if rule.mode == "enforce" %}
+              <form method="post" action="{% url 'rerun_rule_history' rule.id %}">
+                {% csrf_token %}
+                <button class="secondary" type="submit">Повторить очистку истории</button>
+              </form>
+            {% endif %}
+            {% if rule.id in pending_rule_change_ids %}
+              <form method="post" action="{% url 'cancel_rule_change' rule.id %}">
+                {% csrf_token %}
+                <button class="secondary" type="submit">Отменить изменение</button>
+              </form>
+            {% endif %}
             {% if rule.id in pending_rule_ids %}
               <form method="post" action="{% url 'cancel_rule_removal' rule.id %}">
                 {% csrf_token %}
@@ -90,6 +115,7 @@
             {% endif %}
           </div>
         </article>
+        {% endwith %}
       {% endfor %}
     </div>
     {% if rules_page.has_other_pages %}
@@ -102,67 +128,13 @@
   {% else %}<p>Правил пока нет.</p>{% endif %}
 </section>
 
-<section class="card" id="history-scan">
-  <div class="row wrap">
-    <div>
-      <h2>Полная история Telegram</h2>
-      <p class="muted">
-        Новые сообщения обрабатываются в первую очередь. История проверяется
-        небольшими фоновыми пакетами и может занять продолжительное время.
-      </p>
-    </div>
-    {% if can_start_history_scan %}
-      <form method="post" action="{% url 'start_history_scan' %}">
-        {% csrf_token %}
-        <button type="submit">Проверить всю историю</button>
-      </form>
-    {% endif %}
-  </div>
-  {% if history_scan %}
-    <div class="history-status"
-         data-history-scan-id="{{ history_scan.id }}"
-         data-history-status="{{ history_scan.status }}">
-      <p>
-        Этап: <strong id="history-phase">{{ history_scan.get_phase_display }}</strong> ·
-        состояние: <strong id="history-status">{{ history_scan.get_status_display }}</strong>
-      </p>
-      <div class="stats">
-        <div><strong id="history-dialogs">{{ history_scan.dialogs_scanned }}</strong><span>диалогов</span></div>
-        <div><strong id="history-messages">{{ history_scan.messages_scanned }}</strong><span>сообщений</span></div>
-        <div><strong id="history-matches">{{ history_scan.matches_found }}</strong><span>совпадений</span></div>
-        <div><strong id="history-deleted">{{ history_scan.deleted_self }}</strong><span>удалено для себя</span></div>
-        <div><strong id="history-skipped">{{ history_scan.skipped_global }}</strong><span>нужны глобальные права</span></div>
-        <div><strong id="history-failed">{{ history_scan.failed_actions }}</strong><span>ошибок действий</span></div>
-      </div>
-      {% if history_scan.preview_matches %}
-        <p>Предварительно найдено: <strong>{{ history_scan.preview_matches }}</strong></p>
-      {% endif %}
-      <div class="actions wrap">
-        {% if history_scan.status == "awaiting_confirmation" %}
-          <form method="post" action="{% url 'confirm_history_scan' history_scan.id %}">
-            {% csrf_token %}
-            <button class="danger" type="submit">Подтвердить удаление из истории</button>
-          </form>
-        {% endif %}
-        {% if history_scan.status == "queued" or history_scan.status == "running" or history_scan.status == "awaiting_confirmation" %}
-          <form method="post" action="{% url 'cancel_history_scan' history_scan.id %}">
-            {% csrf_token %}
-            <button class="secondary" type="submit">Остановить</button>
-          </form>
-        {% endif %}
-      </div>
-      {% if history_scan_require_preview %}
-        <p class="warning">
-          На этапе разработки удаление запускается только после полного preview
-          и отдельного подтверждения. Уже удалённые сообщения восстановить нельзя.
-        </p>
-      {% endif %}
-      <p class="muted">
-        В каналах и супергруппах совпадения учитываются, но массовое глобальное
-        удаление этой функцией не выполняется.
-      </p>
-    </div>
-  {% endif %}
+<section class="card">
+  <h2>Фоновая очистка истории</h2>
+  <p class="muted">
+    Новые сообщения обрабатываются в первую очередь. Для режима удаления очистка
+    выбранной истории запускается автоматически после сохранения правила.
+    Уже удалённые сообщения восстановить нельзя.
+  </p>
 </section>
 
 <section class="card">
