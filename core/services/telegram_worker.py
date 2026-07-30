@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import datetime
@@ -20,6 +21,7 @@ from telethon.tl import functions, types
 from core.models import (
     FilterEvent,
     ForbiddenRule,
+    HistoryScan,
     MiniAppAuditEvent,
     MiniAppPolicy,
     TelegramAccount,
@@ -152,6 +154,92 @@ def _record_account_update(account_id: int, direction: str, result: str) -> None
 
 
 @sync_to_async
+def _claim_history_scan(account_id: int) -> dict[str, Any] | None:
+    scan = (
+        HistoryScan.objects.filter(
+            account_id=account_id,
+            status__in=[HistoryScan.Status.QUEUED, HistoryScan.Status.RUNNING],
+        )
+        .order_by("created_at")
+        .first()
+    )
+    if scan is None:
+        return None
+    if scan.status == HistoryScan.Status.QUEUED:
+        scan.status = HistoryScan.Status.RUNNING
+        scan.started_at = scan.started_at or timezone.now()
+        scan.last_error_code = ""
+        scan.save(
+            update_fields=["status", "started_at", "last_error_code", "updated_at"]
+        )
+    return {
+        "id": scan.pk,
+        "phase": scan.phase,
+        "dialogs_scanned": scan.dialogs_scanned,
+        "message_offset_id": scan.message_offset_id,
+        "messages_scanned": scan.messages_scanned,
+        "matches_found": scan.matches_found,
+        "deleted_self": scan.deleted_self,
+        "skipped_global": scan.skipped_global,
+        "failed_actions": scan.failed_actions,
+    }
+
+
+@sync_to_async
+def _history_scan_cancel_requested(scan_id: int) -> bool:
+    return bool(
+        HistoryScan.objects.filter(pk=scan_id).values_list(
+            "cancel_requested", flat=True
+        ).get()
+    )
+
+
+@sync_to_async
+def _update_history_scan_progress(
+    scan_id: int,
+    *,
+    dialogs_scanned: int,
+    message_offset_id: int,
+    messages_scanned: int,
+    matches_found: int,
+    deleted_self: int,
+    skipped_global: int,
+    failed_actions: int,
+    last_error_code: str = "",
+) -> None:
+    HistoryScan.objects.filter(pk=scan_id, status=HistoryScan.Status.RUNNING).update(
+        dialogs_scanned=dialogs_scanned,
+        message_offset_id=message_offset_id,
+        messages_scanned=messages_scanned,
+        matches_found=matches_found,
+        deleted_self=deleted_self,
+        skipped_global=skipped_global,
+        failed_actions=failed_actions,
+        last_error_code=last_error_code[:64],
+        updated_at=timezone.now(),
+    )
+
+
+@sync_to_async
+def _finish_history_scan(scan_id: int, status: str, error_code: str = "") -> None:
+    HistoryScan.objects.filter(pk=scan_id).update(
+        status=status,
+        cancel_requested=False,
+        message_offset_id=0,
+        last_error_code=error_code[:64],
+        completed_at=timezone.now()
+        if status
+        in {
+            HistoryScan.Status.COMPLETED,
+            HistoryScan.Status.CANCELLED,
+            HistoryScan.Status.FAILED,
+        }
+        else None,
+        updated_at=timezone.now(),
+    )
+
+
+@sync_to_async
 def _load_mini_app_state(
     account_id: int,
 ) -> tuple[dict[str, Any], list[MiniAppRuleSpec]]:
@@ -245,6 +333,7 @@ class AccountRunner:
         self.mini_app_reconcile_lock = asyncio.Lock()
         self.next_mini_app_reconcile_at = 0.0
         self.warned_mini_app_bot_ids: set[int] = set()
+        self.history_scan_task: asyncio.Task[None] | None = None
 
     def request_revoke(self) -> None:
         self.revoke_on_stop = True
@@ -272,6 +361,10 @@ class AccountRunner:
                 exc.__class__.__name__,
             )
         finally:
+            if self.history_scan_task and not self.history_scan_task.done():
+                self.history_scan_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.history_scan_task
             if self.client:
                 if self.revoke_on_stop:
                     try:
@@ -307,6 +400,7 @@ class AccountRunner:
         await _set_account_state(int(self.account["id"]), TelegramAccount.Status.ACTIVE)
         while self.client.is_connected():
             await _set_account_state(int(self.account["id"]), TelegramAccount.Status.ACTIVE)
+            await self._sync_history_scan()
             await self._maybe_reconcile_mini_apps()
             try:
                 await asyncio.wait_for(
@@ -315,6 +409,173 @@ class AccountRunner:
                 )
             except TimeoutError:
                 continue
+
+    async def _sync_history_scan(self) -> None:
+        if self.history_scan_task is not None:
+            if not self.history_scan_task.done():
+                return
+            await self.history_scan_task
+            self.history_scan_task = None
+        scan = await _claim_history_scan(int(self.account["id"]))
+        if scan is not None:
+            self.history_scan_task = asyncio.create_task(
+                self._run_history_scan(scan),
+                name=f"history-scan-{scan['id']}",
+            )
+
+    async def _run_history_scan(self, scan: dict[str, Any]) -> None:
+        scan_id = int(scan["id"])
+        try:
+            await self._scan_history(scan)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "history_scan_failed account_id=%s scan_id=%s error=%s",
+                self.account["id"],
+                scan_id,
+                exc.__class__.__name__,
+            )
+            await _finish_history_scan(
+                scan_id,
+                HistoryScan.Status.FAILED,
+                exc.__class__.__name__,
+            )
+
+    async def _scan_history(self, scan: dict[str, Any]) -> None:
+        if not self.client or not self.user:
+            raise RuntimeError("client_unavailable")
+        scan_id = int(scan["id"])
+        phase = str(scan["phase"])
+        dialog_cursor = int(scan["dialogs_scanned"])
+        message_offset_id = int(scan["message_offset_id"])
+        messages_scanned = int(scan["messages_scanned"])
+        matches_found = int(scan["matches_found"])
+        deleted_self = int(scan["deleted_self"])
+        skipped_global = int(scan["skipped_global"])
+        failed_actions = int(scan["failed_actions"])
+        rules_by_direction = {
+            FilterEvent.Direction.INCOMING: await _load_rules(
+                self.user, FilterEvent.Direction.INCOMING
+            ),
+            FilterEvent.Direction.OUTGOING: await _load_rules(
+                self.user, FilterEvent.Direction.OUTGOING
+            ),
+        }
+        batch_count = 0
+        dialog_index = 0
+        async for dialog in self.client.iter_dialogs():
+            if dialog_index < dialog_cursor:
+                dialog_index += 1
+                continue
+            current_offset = message_offset_id if dialog_index == dialog_cursor else 0
+            chat_type = self._history_chat_type(dialog)
+            async for message in self.client.iter_messages(
+                dialog.input_entity,
+                offset_id=current_offset,
+            ):
+                messages_scanned += 1
+                batch_count += 1
+                direction = (
+                    FilterEvent.Direction.OUTGOING
+                    if bool(getattr(message, "out", False))
+                    else FilterEvent.Direction.INCOMING
+                )
+                text = str(getattr(message, "raw_text", "") or "")
+                if not text.startswith((MINI_APP_WARNING_PREFIX, FILTER_WARNING_PREFIX)):
+                    candidates = extract_candidates(
+                        text,
+                        list(getattr(message, "entities", None) or []),
+                    )
+                    if getattr(message, "media", None):
+                        candidates = [
+                            TextCandidate(
+                                "caption" if item.source == "body" else item.source,
+                                item.value,
+                            )
+                            for item in candidates
+                        ]
+                    rules = rules_by_direction[direction]
+                    modes = {rule_id: mode for rule_id, _phrase, mode in rules}
+                    matched = find_matches(
+                        candidates,
+                        [(rule_id, phrase) for rule_id, phrase, _mode in rules],
+                    )
+                    if matched:
+                        matches_found += 1
+                        matched_modes = {
+                            modes[item.rule_id]
+                            for item in matched
+                        }
+                        if (
+                            phase == HistoryScan.Phase.ENFORCE
+                            and ForbiddenRule.Mode.ENFORCE in matched_modes
+                        ):
+                            if chat_type in {"channel", "supergroup"}:
+                                skipped_global += 1
+                            else:
+                                try:
+                                    await self._delete_with_retry(
+                                        message, revoke=False
+                                    )
+                                except Exception as exc:
+                                    failed_actions += 1
+                                    scan["last_error_code"] = exc.__class__.__name__
+                                else:
+                                    deleted_self += 1
+                current_offset = int(message.id)
+                if batch_count >= settings.HISTORY_SCAN_BATCH_SIZE:
+                    await _update_history_scan_progress(
+                        scan_id,
+                        dialogs_scanned=dialog_index,
+                        message_offset_id=current_offset,
+                        messages_scanned=messages_scanned,
+                        matches_found=matches_found,
+                        deleted_self=deleted_self,
+                        skipped_global=skipped_global,
+                        failed_actions=failed_actions,
+                        last_error_code=str(scan.get("last_error_code", "")),
+                    )
+                    if await _history_scan_cancel_requested(scan_id):
+                        await _finish_history_scan(
+                            scan_id, HistoryScan.Status.CANCELLED
+                        )
+                        return
+                    batch_count = 0
+                    await asyncio.sleep(settings.HISTORY_SCAN_YIELD_SECONDS)
+            dialog_index += 1
+            message_offset_id = 0
+            await _update_history_scan_progress(
+                scan_id,
+                dialogs_scanned=dialog_index,
+                message_offset_id=0,
+                messages_scanned=messages_scanned,
+                matches_found=matches_found,
+                deleted_self=deleted_self,
+                skipped_global=skipped_global,
+                failed_actions=failed_actions,
+                last_error_code=str(scan.get("last_error_code", "")),
+            )
+            if await _history_scan_cancel_requested(scan_id):
+                await _finish_history_scan(scan_id, HistoryScan.Status.CANCELLED)
+                return
+            await asyncio.sleep(settings.HISTORY_SCAN_YIELD_SECONDS)
+        final_status = (
+            HistoryScan.Status.AWAITING_CONFIRMATION
+            if phase == HistoryScan.Phase.PREVIEW
+            else HistoryScan.Status.COMPLETED
+        )
+        await _finish_history_scan(scan_id, final_status)
+
+    def _history_chat_type(self, dialog: Any) -> str:
+        if int(getattr(dialog, "id", 0)) == self.own_id:
+            return "saved"
+        if bool(getattr(dialog, "is_user", False)):
+            return "private"
+        if bool(getattr(dialog, "is_channel", False)):
+            entity = getattr(dialog, "entity", None)
+            return "supergroup" if bool(getattr(entity, "megagroup", False)) else "channel"
+        return "group"
 
     async def _handle_message(self, event: Any) -> None:
         if not self.user:

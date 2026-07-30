@@ -12,6 +12,7 @@ from core.models import (
     DisconnectRequest,
     FilterEvent,
     ForbiddenRule,
+    HistoryScan,
     Invitation,
     MiniAppAuditEvent,
     MiniAppPolicy,
@@ -108,6 +109,107 @@ def test_user_can_add_but_not_directly_delete_rule(client: Client) -> None:
     )
     assert duplicate.status_code == 200
     assert "уже существует" in duplicate.content.decode()
+
+
+def test_user_can_cancel_pending_rule_removal(client: Client) -> None:
+    user = User.objects.create_user("cancel-removal", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    rule = create_rule(user, "keep this rule")
+    removal = RuleRemovalRequest.objects.create(user=user, rule=rule)
+    client.force_login(user)
+
+    page = client.get(reverse("dashboard"))
+    assert "Отменить запрос на удаление" in page.content.decode()
+    response = client.post(
+        reverse("cancel_rule_removal", kwargs={"rule_id": rule.pk})
+    )
+
+    assert response.status_code == 302
+    removal.refresh_from_db()
+    assert removal.status == RuleRemovalRequest.Status.CANCELLED
+    assert removal.resolved_at is not None
+    assert ForbiddenRule.objects.filter(pk=rule.pk).exists()
+
+
+def test_user_cannot_cancel_another_users_removal(client: Client) -> None:
+    owner = User.objects.create_user("removal-owner", password="long-password-123")
+    other = User.objects.create_user("removal-other", password="long-password-123")
+    rule = create_rule(owner, "private rule")
+    RuleRemovalRequest.objects.create(user=owner, rule=rule)
+    client.force_login(other)
+    assert (
+        client.post(
+            reverse("cancel_rule_removal", kwargs={"rule_id": rule.pk})
+        ).status_code
+        == 404
+    )
+
+
+def test_history_scan_preview_confirm_cancel_and_isolation(
+    client: Client, settings: object
+) -> None:
+    settings.HISTORY_SCAN_REQUIRE_PREVIEW = True
+    owner = User.objects.create_user("history-owner", password="long-password-123")
+    other = User.objects.create_user("history-other", password="long-password-123")
+    account = TelegramAccount.objects.create(user=owner, encrypted_session="encrypted")
+    other_account = TelegramAccount.objects.create(
+        user=other, encrypted_session="encrypted-other"
+    )
+    client.force_login(owner)
+
+    started = client.post(reverse("start_history_scan"))
+    assert started.status_code == 302
+    scan = account.history_scans.get()
+    assert scan.phase == HistoryScan.Phase.PREVIEW
+    assert scan.status == HistoryScan.Status.QUEUED
+    assert client.post(reverse("start_history_scan")).status_code == 302
+    assert account.history_scans.count() == 1
+
+    scan.status = HistoryScan.Status.AWAITING_CONFIRMATION
+    scan.matches_found = 7
+    scan.save(update_fields=["status", "matches_found"])
+    assert (
+        client.post(
+            reverse("confirm_history_scan", kwargs={"scan_id": scan.pk})
+        ).status_code
+        == 302
+    )
+    scan.refresh_from_db()
+    assert scan.phase == HistoryScan.Phase.ENFORCE
+    assert scan.status == HistoryScan.Status.QUEUED
+    assert scan.preview_matches == 7
+    assert scan.messages_scanned == 0
+
+    assert (
+        client.post(
+            reverse("cancel_history_scan", kwargs={"scan_id": scan.pk})
+        ).status_code
+        == 302
+    )
+    scan.refresh_from_db()
+    assert scan.status == HistoryScan.Status.CANCELLED
+
+    foreign = HistoryScan.objects.create(
+        account=other_account,
+        phase=HistoryScan.Phase.PREVIEW,
+    )
+    assert (
+        client.post(
+            reverse("cancel_history_scan", kwargs={"scan_id": foreign.pk})
+        ).status_code
+        == 404
+    )
+
+
+def test_history_scan_can_skip_development_preview(
+    client: Client, settings: object
+) -> None:
+    settings.HISTORY_SCAN_REQUIRE_PREVIEW = False
+    user = User.objects.create_user("direct-history", password="long-password-123")
+    account = TelegramAccount.objects.create(user=user, encrypted_session="encrypted")
+    client.force_login(user)
+    assert client.post(reverse("start_history_scan")).status_code == 302
+    assert account.history_scans.get().phase == HistoryScan.Phase.ENFORCE
 
 
 def test_disconnect_creates_request_without_disabling_account(client: Client) -> None:

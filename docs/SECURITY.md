@@ -36,6 +36,10 @@ Platform master key хранится отдельно от PostgreSQL backup. П
   timestamp, result и короткий error code.
 - В message-filter audit сохраняются только account, rule, направление, источник,
   тип чата, timestamp, результат и короткий error code — без текста, sender и peer ID.
+- History scan хранит только account, phase/status, агрегированные счётчики,
+  номер обработанного диалога и message offset без peer ID, названий и текста.
+- Массовое глобальное удаление channel/supergroup history запрещено независимо
+  от временного development preview flag.
 
 ## Инциденты
 

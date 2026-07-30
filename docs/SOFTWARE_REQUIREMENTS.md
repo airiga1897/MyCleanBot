@@ -34,6 +34,9 @@
   и проверка отсутствия sensitive logging.
 - Обязательна матрица входящих/исходящих новых сообщений и edits для private chat,
   basic group, supergroup и channel с наличием и отсутствием права удаления.
+- History scan тестируется через mock `iter_dialogs`/`iter_messages`: полный preview,
+  подтверждение, безопасное локальное удаление, skip global-only чатов, cursor resume
+  и cancellation.
 - MTProto Mini App operations тестируются только через mock client; CI не использует
   реальные Telegram credentials или аккаунты.
 - CI использует временный PostgreSQL; production database не используется.
@@ -58,4 +61,5 @@
 - `/livez` — process liveness;
 - `/healthz` — database и worker readiness;
 - PostgreSQL heartbeat между web и worker;
+- низкоприоритетный resumable history scan с пакетным progress;
 - `repository_dispatch` между product CI и platform CD.

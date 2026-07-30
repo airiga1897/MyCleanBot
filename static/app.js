@@ -82,6 +82,28 @@ if (statusRoot) {
     document.getElementById("stat-total").textContent = data.stats.total;
     document.getElementById("stat-successful").textContent = data.stats.successful;
     document.getElementById("stat-failed").textContent = data.stats.failed;
+    const historyRoot = document.querySelector(".history-status");
+    if (historyRoot && data.history_scan) {
+      const scan = data.history_scan;
+      [
+        ["history-phase", scan.phase],
+        ["history-status", scan.status],
+        ["history-dialogs", scan.dialogs_scanned],
+        ["history-messages", scan.messages_scanned],
+        ["history-matches", scan.matches_found],
+        ["history-deleted", scan.deleted_self],
+        ["history-skipped", scan.skipped_global],
+        ["history-failed", scan.failed_actions],
+      ].forEach(([id, value]) => {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+      });
+      if (historyRoot.dataset.historyStatus !== scan.status_code &&
+          ["awaiting_confirmation", "completed", "cancelled", "failed"].includes(scan.status_code)) {
+        window.location.reload();
+        return;
+      }
+    }
     const body = document.getElementById("event-table-body");
     body.replaceChildren();
     if (!data.events.length) {

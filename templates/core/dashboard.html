@@ -76,7 +76,10 @@
               </form>
             </details>
             {% if rule.id in pending_rule_ids %}
-              <span class="badge warning">Удаление ожидает оператора</span>
+              <form method="post" action="{% url 'cancel_rule_removal' rule.id %}">
+                {% csrf_token %}
+                <button class="secondary" type="submit">Отменить запрос на удаление</button>
+              </form>
             {% else %}
               <form method="post" action="{% url 'request_rule_removal' rule.id %}">
                 {% csrf_token %}
@@ -97,6 +100,69 @@
       </nav>
     {% endif %}
   {% else %}<p>Правил пока нет.</p>{% endif %}
+</section>
+
+<section class="card" id="history-scan">
+  <div class="row wrap">
+    <div>
+      <h2>Полная история Telegram</h2>
+      <p class="muted">
+        Новые сообщения обрабатываются в первую очередь. История проверяется
+        небольшими фоновыми пакетами и может занять продолжительное время.
+      </p>
+    </div>
+    {% if can_start_history_scan %}
+      <form method="post" action="{% url 'start_history_scan' %}">
+        {% csrf_token %}
+        <button type="submit">Проверить всю историю</button>
+      </form>
+    {% endif %}
+  </div>
+  {% if history_scan %}
+    <div class="history-status"
+         data-history-scan-id="{{ history_scan.id }}"
+         data-history-status="{{ history_scan.status }}">
+      <p>
+        Этап: <strong id="history-phase">{{ history_scan.get_phase_display }}</strong> ·
+        состояние: <strong id="history-status">{{ history_scan.get_status_display }}</strong>
+      </p>
+      <div class="stats">
+        <div><strong id="history-dialogs">{{ history_scan.dialogs_scanned }}</strong><span>диалогов</span></div>
+        <div><strong id="history-messages">{{ history_scan.messages_scanned }}</strong><span>сообщений</span></div>
+        <div><strong id="history-matches">{{ history_scan.matches_found }}</strong><span>совпадений</span></div>
+        <div><strong id="history-deleted">{{ history_scan.deleted_self }}</strong><span>удалено для себя</span></div>
+        <div><strong id="history-skipped">{{ history_scan.skipped_global }}</strong><span>нужны глобальные права</span></div>
+        <div><strong id="history-failed">{{ history_scan.failed_actions }}</strong><span>ошибок действий</span></div>
+      </div>
+      {% if history_scan.preview_matches %}
+        <p>Предварительно найдено: <strong>{{ history_scan.preview_matches }}</strong></p>
+      {% endif %}
+      <div class="actions wrap">
+        {% if history_scan.status == "awaiting_confirmation" %}
+          <form method="post" action="{% url 'confirm_history_scan' history_scan.id %}">
+            {% csrf_token %}
+            <button class="danger" type="submit">Подтвердить удаление из истории</button>
+          </form>
+        {% endif %}
+        {% if history_scan.status == "queued" or history_scan.status == "running" or history_scan.status == "awaiting_confirmation" %}
+          <form method="post" action="{% url 'cancel_history_scan' history_scan.id %}">
+            {% csrf_token %}
+            <button class="secondary" type="submit">Остановить</button>
+          </form>
+        {% endif %}
+      </div>
+      {% if history_scan_require_preview %}
+        <p class="warning">
+          На этапе разработки удаление запускается только после полного preview
+          и отдельного подтверждения. Уже удалённые сообщения восстановить нельзя.
+        </p>
+      {% endif %}
+      <p class="muted">
+        В каналах и супергруппах совпадения учитываются, но массовое глобальное
+        удаление этой функцией не выполняется.
+      </p>
+    </div>
+  {% endif %}
 </section>
 
 <section class="card">

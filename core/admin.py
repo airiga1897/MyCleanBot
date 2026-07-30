@@ -7,6 +7,7 @@ from core.models import (
     DisconnectRequest,
     FilterEvent,
     ForbiddenRule,
+    HistoryScan,
     Invitation,
     MiniAppAuditEvent,
     MiniAppPolicy,
@@ -29,6 +30,7 @@ for model, singular, plural in (
     (RuleRemovalRequest, "запрос удаления правила", "запросы удаления правил"),
     (DisconnectRequest, "запрос отключения", "запросы отключения"),
     (FilterEvent, "событие фильтра", "события фильтра"),
+    (HistoryScan, "проверка истории", "проверки истории"),
     (MiniAppPolicy, "политика Mini Apps", "политики Mini Apps"),
     (MiniAppRule, "правило Mini Apps", "правила Mini Apps"),
     (MiniAppAuditEvent, "событие Mini Apps", "события Mini Apps"),
@@ -200,6 +202,43 @@ class FilterEventAdmin(admin.ModelAdmin):
         "result",
         "error_code",
         "created_at",
+    )
+
+    def has_add_permission(self, request: object) -> bool:
+        return False
+
+
+@admin.register(HistoryScan)
+class HistoryScanAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "account",
+        "phase",
+        "status",
+        "dialogs_scanned",
+        "messages_scanned",
+        "matches_found",
+        "created_at",
+    )
+    readonly_fields = (
+        "account",
+        "phase",
+        "status",
+        "cancel_requested",
+        "dialogs_scanned",
+        "message_offset_id",
+        "messages_scanned",
+        "matches_found",
+        "preview_matches",
+        "deleted_self",
+        "skipped_global",
+        "failed_actions",
+        "last_error_code",
+        "created_at",
+        "started_at",
+        "confirmed_at",
+        "completed_at",
+        "updated_at",
     )
 
     def has_add_permission(self, request: object) -> bool:
