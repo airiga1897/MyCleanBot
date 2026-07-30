@@ -503,7 +503,7 @@ def revoke_invitation(request: HttpRequest, invitation_id: int) -> HttpResponse:
 @transaction.atomic
 def resolve_rule_removal(request: HttpRequest, request_id: int, decision: str) -> HttpResponse:
     removal = get_object_or_404(
-        RuleRemovalRequest.objects.select_for_update().select_related("rule"),
+        RuleRemovalRequest.objects.select_for_update(),
         pk=request_id,
         status=RuleRemovalRequest.Status.PENDING,
     )
