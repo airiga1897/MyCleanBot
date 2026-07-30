@@ -2,17 +2,19 @@
 {% block content %}
 <section class="card narrow">
   <h1>Подключение Telegram</h1>
-  {% if not flow or flow.state == "failed" or flow.state == "expired" %}
+  {% if not flow or flow.state == "failed" or flow.state == "expired" or flow.state == "cancelled" %}
     <form method="post" action="{% url 'start_qr_auth' %}">
       {% csrf_token %}
       <button type="submit">Подключить по QR</button>
     </form>
     <a class="button secondary" href="{% url 'start_phone_auth' %}">Использовать телефон и код</a>
   {% elif flow.state == "queued" %}
-    <p>Запрос ожидает worker. Обновите страницу через несколько секунд.</p>
+    <p class="progress">Запрос ожидает worker. Страница обновится автоматически.</p>
   {% elif flow.state == "qr_ready" %}
     <p>Отсканируйте QR-код официальным приложением Telegram.</p>
     <img class="qr" src="data:image/png;base64,{{ qr_data }}" alt="QR для Telegram">
+  {% elif flow.state == "verifying" %}
+    <p class="progress">Проверяем данные и завершаем подключение. Страница обновится автоматически.</p>
   {% elif flow.state == "code_required" or flow.state == "password_required" %}
     <p>{% if flow.state == "code_required" %}Введите одноразовый код.{% else %}Введите пароль 2FA.{% endif %}</p>
     <form method="post" action="{% url 'submit_auth_secret' %}">
@@ -20,11 +22,16 @@
       {{ secret_form.as_p }}
       <button type="submit">Продолжить</button>
     </form>
-  {% elif flow.state == "complete" %}
-    <p>Telegram успешно подключён.</p>
-    <a class="button" href="{% url 'dashboard' %}">Вернуться</a>
   {% endif %}
-  {% if flow.error_code %}<p class="warning">Ошибка: {{ flow.error_code }}</p>{% endif %}
+  {% if flow and flow.state != "failed" and flow.state != "expired" and flow.state != "cancelled" %}
+    <div class="row wrap auth-actions">
+      {% if flow.kind == "qr" %}<a class="button secondary" href="{% url 'start_phone_auth' %}">Телефон и код</a>{% endif %}
+      <form method="post" action="{% url 'cancel_telegram_auth' %}">
+        {% csrf_token %}
+        <button class="danger" type="submit">Отменить попытку</button>
+      </form>
+    </div>
+  {% endif %}
+  {% if flow.error_code %}<p class="warning">Ошибка: {{ auth_error }}</p>{% endif %}
 </section>
 {% endblock %}
-

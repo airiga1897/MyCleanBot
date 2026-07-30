@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
-from core.models import MiniAppPolicy, MiniAppRule
+from core.models import ForbiddenRule, MiniAppPolicy, MiniAppRule
 from core.services.miniapps import normalize_rule_value
 
 
@@ -24,9 +24,25 @@ class RuleForm(forms.Form):
         strip=True,
         widget=forms.Textarea(attrs={"rows": 3}),
     )
-    confirm_locked = forms.BooleanField(
-        label="Я понимаю, что удаление правила потребует подтверждения администратора"
+    direction = forms.ChoiceField(
+        label="Применять к сообщениям",
+        choices=ForbiddenRule.Direction.choices,
+        initial=ForbiddenRule.Direction.BOTH,
     )
+    mode = forms.ChoiceField(
+        label="Режим",
+        choices=ForbiddenRule.Mode.choices,
+        initial=ForbiddenRule.Mode.ENFORCE,
+    )
+    is_locked = forms.BooleanField(
+        required=False,
+        initial=True,
+        label="Защитить правило: удаление потребует подтверждения оператора",
+    )
+
+
+class RuleTestForm(forms.Form):
+    text = forms.CharField(label="Тестовый текст", max_length=2000, strip=False)
 
 
 class PhoneAuthForm(forms.Form):
@@ -34,7 +50,11 @@ class PhoneAuthForm(forms.Form):
 
 
 class AuthSecretForm(forms.Form):
-    secret = forms.CharField(label="Код или пароль 2FA", max_length=256)
+    secret = forms.CharField(
+        label="Код или пароль 2FA",
+        max_length=256,
+        widget=forms.PasswordInput(attrs={"autocomplete": "one-time-code"}),
+    )
 
 
 class MiniAppPolicyForm(forms.ModelForm):  # type: ignore[type-arg]

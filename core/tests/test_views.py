@@ -10,6 +10,8 @@ from django.utils import timezone
 
 from core.models import (
     DisconnectRequest,
+    FilterEvent,
+    ForbiddenRule,
     Invitation,
     MiniAppAuditEvent,
     MiniAppPolicy,
@@ -79,7 +81,15 @@ def test_user_can_add_but_not_directly_delete_rule(client: Client) -> None:
     user = User.objects.create_user("owner", password="long-password-123")
     TelegramAccount.objects.create(user=user)
     client.force_login(user)
-    response = client.post(reverse("add_rule"), {"phrase": "locked phrase", "confirm_locked": "on"})
+    response = client.post(
+        reverse("add_rule"),
+        {
+            "phrase": "locked phrase",
+            "direction": ForbiddenRule.Direction.BOTH,
+            "mode": ForbiddenRule.Mode.ENFORCE,
+            "is_locked": "on",
+        },
+    )
     assert response.status_code == 302
     rule = user.forbidden_rules.get()
     response = client.post(reverse("request_rule_removal", kwargs={"rule_id": rule.pk}))
@@ -88,7 +98,13 @@ def test_user_can_add_but_not_directly_delete_rule(client: Client) -> None:
     assert user.forbidden_rules.filter(pk=rule.pk).exists()
 
     duplicate = client.post(
-        reverse("add_rule"), {"phrase": "LOCKED PHRASE", "confirm_locked": "on"}
+        reverse("add_rule"),
+        {
+            "phrase": "LOCKED PHRASE",
+            "direction": ForbiddenRule.Direction.BOTH,
+            "mode": ForbiddenRule.Mode.ENFORCE,
+            "is_locked": "on",
+        },
     )
     assert duplicate.status_code == 200
     assert "уже существует" in duplicate.content.decode()
@@ -105,7 +121,7 @@ def test_disconnect_creates_request_without_disabling_account(client: Client) ->
     assert account.desired_enabled
 
 
-def test_dashboard_only_contains_current_users_events_and_rules(client: Client) -> None:
+def test_dashboard_masks_rules_and_isolates_user_data(client: Client) -> None:
     first = User.objects.create_user("first", password="long-password-123")
     second = User.objects.create_user("second", password="long-password-123")
     TelegramAccount.objects.create(user=first)
@@ -114,8 +130,74 @@ def test_dashboard_only_contains_current_users_events_and_rules(client: Client) 
     create_rule(second, "hidden phrase")
     client.force_login(first)
     body = client.get(reverse("dashboard")).content.decode()
-    assert "visible phrase" in body
+    assert "visible phrase" not in body
     assert "hidden phrase" not in body
+    own_rule = first.forbidden_rules.get()
+    reveal = client.post(reverse("reveal_rule", kwargs={"rule_id": own_rule.pk}))
+    assert reveal.json() == {"phrase": "visible phrase"}
+    assert reveal.headers["Cache-Control"] == "no-store"
+    other_rule = second.forbidden_rules.get()
+    assert (
+        client.post(reverse("reveal_rule", kwargs={"rule_id": other_rule.pk})).status_code
+        == 404
+    )
+
+
+def test_unlocked_rule_is_deleted_without_operator(client: Client) -> None:
+    user = User.objects.create_user("unlocked-owner", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    rule = create_rule(user, "temporary", is_locked=False)
+    client.force_login(user)
+    response = client.post(reverse("request_rule_removal", kwargs={"rule_id": rule.pk}))
+    assert response.status_code == 302
+    assert not ForbiddenRule.objects.filter(pk=rule.pk).exists()
+    assert not RuleRemovalRequest.objects.exists()
+
+
+def test_rule_test_does_not_create_audit_event(client: Client) -> None:
+    user = User.objects.create_user("test-owner", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    rule = create_rule(user, "hidden marker")
+    client.force_login(user)
+    response = client.post(
+        reverse("test_rule", kwargs={"rule_id": rule.pk}),
+        {"text": "contains HIDDEN   MARKER here"},
+    )
+    assert response.json() == {"matched": True}
+    assert not FilterEvent.objects.exists()
+
+
+def test_dashboard_status_is_sanitized_and_user_scoped(client: Client) -> None:
+    owner = User.objects.create_user("status-owner", password="long-password-123")
+    other = User.objects.create_user("status-other", password="long-password-123")
+    account = TelegramAccount.objects.create(user=owner, status=TelegramAccount.Status.ACTIVE)
+    TelegramAccount.objects.create(user=other)
+    rule = create_rule(owner, "never expose this")
+    other_rule = create_rule(other, "other secret")
+    FilterEvent.objects.create(
+        user=owner,
+        rule_ids=[rule.pk],
+        direction=FilterEvent.Direction.INCOMING,
+        source="body",
+        chat_type="private",
+        result=FilterEvent.Result.DELETED_SELF,
+    )
+    FilterEvent.objects.create(
+        user=other,
+        rule_ids=[other_rule.pk],
+        direction=FilterEvent.Direction.OUTGOING,
+        source="body",
+        chat_type="group",
+        result=FilterEvent.Result.FAILED,
+    )
+    client.force_login(owner)
+    payload = client.get(reverse("dashboard_status")).json()
+    assert payload["account"]["status"] == account.get_status_display()
+    assert payload["stats"] == {"total": 1, "successful": 1, "failed": 0}
+    assert payload["events"][0]["rule_ids"] == [rule.pk]
+    serialized = str(payload)
+    assert "never expose this" not in serialized
+    assert "other secret" not in serialized
 
 
 def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
@@ -284,7 +366,43 @@ def test_qr_page_and_secret_submission(client: Client) -> None:
     response = client.post(reverse("submit_auth_secret"), {"secret": "12345"})
     assert response.status_code == 302
     flow.refresh_from_db()
+    assert flow.state == TelegramAuthFlow.State.VERIFYING
     assert decrypt_for_user(user, flow.encrypted_payload) == "12345"
+
+
+def test_auth_waiting_refreshes_and_complete_redirects(client: Client) -> None:
+    user = User.objects.create_user("auth-refresh", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+    flow = TelegramAuthFlow.objects.create(
+        user=user,
+        kind=TelegramAuthFlow.Kind.PHONE,
+        state=TelegramAuthFlow.State.VERIFYING,
+        expires_at=timezone.now() + timedelta(minutes=5),
+    )
+    waiting = client.get(reverse("telegram_auth"))
+    assert waiting.headers["Refresh"] == "2"
+    assert "Страница обновится автоматически" in waiting.content.decode()
+    flow.state = TelegramAuthFlow.State.COMPLETE
+    flow.save(update_fields=["state"])
+    assert client.get(reverse("telegram_auth")).status_code == 302
+
+
+def test_user_can_cancel_auth_flow(client: Client) -> None:
+    user = User.objects.create_user("auth-cancel", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+    flow = TelegramAuthFlow.objects.create(
+        user=user,
+        kind=TelegramAuthFlow.Kind.QR,
+        state=TelegramAuthFlow.State.QR_READY,
+        encrypted_payload=encrypt_for_user(user, "tg://login?token=test"),
+        expires_at=timezone.now() + timedelta(minutes=5),
+    )
+    assert client.post(reverse("cancel_telegram_auth")).status_code == 302
+    flow.refresh_from_db()
+    assert flow.state == TelegramAuthFlow.State.CANCELLED
+    assert flow.encrypted_payload == ""
 
 
 def test_staff_creates_invitation_and_limit_is_enforced(client: Client) -> None:
@@ -294,11 +412,70 @@ def test_staff_creates_invitation_and_limit_is_enforced(client: Client) -> None:
     created = client.post(reverse("create_invitation"))
     assert created.status_code == 200
     assert "/invite/" in created.content.decode()
+    assert "Копировать ссылку" in created.content.decode()
     assert Invitation.objects.filter(created_by=admin).count() == 1
-
-    for index in range(10):
+    for index in range(9):
         user = User.objects.create_user(f"limited-{index}", password="long-password-123")
         TelegramAccount.objects.create(user=user)
     limited = client.post(reverse("create_invitation"))
-    assert "Достигнут лимит" in limited.content.decode()
+    assert "Свободных мест" in limited.content.decode()
     assert Invitation.objects.filter(created_by=admin).count() == 1
+
+
+def test_operator_dashboard_and_invitation_revocation_are_staff_only(
+    client: Client,
+) -> None:
+    user = User.objects.create_user("regular", password="long-password-123")
+    client.force_login(user)
+    assert client.get(reverse("operator_dashboard")).status_code == 302
+
+    operator = User.objects.create_superuser(
+        "operator-ui", "operator@example.test", "admin-password-123"
+    )
+    client.force_login(operator)
+    page = client.get(reverse("operator_dashboard"))
+    assert page.status_code == 200
+    assert "Кабинет оператора" in page.content.decode()
+    invitation, _token = Invitation.issue(operator)
+    response = client.post(
+        reverse("revoke_invitation", kwargs={"invitation_id": invitation.pk})
+    )
+    assert response.status_code == 302
+    invitation.refresh_from_db()
+    assert invitation.revoked_at is not None
+    assert not invitation.is_valid()
+
+
+def test_operator_resolves_rule_and_disconnect_requests(client: Client) -> None:
+    operator = User.objects.create_superuser(
+        "operator-resolve", "operator@example.test", "admin-password-123"
+    )
+    user = User.objects.create_user("managed-user", password="long-password-123")
+    account = TelegramAccount.objects.create(user=user, desired_enabled=True)
+    rule = create_rule(user, "protected")
+    removal = RuleRemovalRequest.objects.create(user=user, rule=rule)
+    disconnect = DisconnectRequest.objects.create(user=user)
+    client.force_login(operator)
+
+    response = client.post(
+        reverse(
+            "resolve_rule_removal",
+            kwargs={"request_id": removal.pk, "decision": "approve"},
+        )
+    )
+    assert response.status_code == 302
+    removal.refresh_from_db()
+    assert removal.status == RuleRemovalRequest.Status.APPROVED
+    assert not ForbiddenRule.objects.filter(pk=rule.pk).exists()
+
+    response = client.post(
+        reverse(
+            "resolve_disconnect",
+            kwargs={"request_id": disconnect.pk, "decision": "approve"},
+        )
+    )
+    assert response.status_code == 302
+    disconnect.refresh_from_db()
+    account.refresh_from_db()
+    assert disconnect.status == DisconnectRequest.Status.APPROVED
+    assert not account.desired_enabled

@@ -13,7 +13,14 @@ class DuplicateRuleError(ValueError):
 
 
 @transaction.atomic
-def create_rule(user: User, phrase: str) -> ForbiddenRule:
+def create_rule(
+    user: User,
+    phrase: str,
+    *,
+    direction: str = ForbiddenRule.Direction.BOTH,
+    mode: str = ForbiddenRule.Mode.ENFORCE,
+    is_locked: bool = True,
+) -> ForbiddenRule:
     normalized = normalize_text(phrase)
     if not normalized:
         raise ValueError("Phrase cannot be empty")
@@ -22,15 +29,29 @@ def create_rule(user: User, phrase: str) -> ForbiddenRule:
             user=user,
             encrypted_phrase=encrypt_for_user(user, phrase.strip()),
             phrase_fingerprint=fingerprint(f"{user.pk}:{normalized}"),
+            direction=direction,
+            mode=mode,
+            is_locked=is_locked,
         )
     except IntegrityError as exc:
         raise DuplicateRuleError("Rule already exists") from exc
 
 
-def decrypted_rules(user: User) -> list[tuple[int, str]]:
+def decrypted_rules(
+    user: User, direction: str | None = None
+) -> list[tuple[int, str, str]]:
+    rules = user.forbidden_rules.filter(active=True)
+    if direction:
+        rules = rules.filter(
+            direction__in=[direction, ForbiddenRule.Direction.BOTH]
+        )
     return [
-        (rule.pk, normalize_text(decrypt_for_user(user, rule.encrypted_phrase)))
-        for rule in user.forbidden_rules.filter(active=True)
+        (
+            rule.pk,
+            normalize_text(decrypt_for_user(user, rule.encrypted_phrase)),
+            rule.mode,
+        )
+        for rule in rules
     ]
 
 

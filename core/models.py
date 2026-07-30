@@ -15,6 +15,7 @@ class Invitation(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
     consumed_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
     consumed_by = models.OneToOneField(
         User, on_delete=models.SET_NULL, null=True, blank=True, related_name="invitation"
     )
@@ -33,7 +34,11 @@ class Invitation(models.Model):
         return invitation, token
 
     def is_valid(self) -> bool:
-        return self.consumed_at is None and self.expires_at > timezone.now()
+        return (
+            self.consumed_at is None
+            and self.revoked_at is None
+            and self.expires_at > timezone.now()
+        )
 
 
 class UserKey(models.Model):
@@ -60,6 +65,9 @@ class TelegramAccount(models.Model):
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
     desired_enabled = models.BooleanField(default=True)
     last_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    last_update_at = models.DateTimeField(null=True, blank=True)
+    last_update_direction = models.CharField(max_length=16, blank=True)
+    last_update_result = models.CharField(max_length=32, blank=True)
     last_error_code = models.CharField(max_length=64, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -68,10 +76,25 @@ class TelegramAccount(models.Model):
 
 
 class ForbiddenRule(models.Model):
+    class Direction(models.TextChoices):
+        INCOMING = "incoming", "Входящие"
+        OUTGOING = "outgoing", "Исходящие"
+        BOTH = "both", "Входящие и исходящие"
+
+    class Mode(models.TextChoices):
+        OBSERVE = "observe", "Наблюдение"
+        WARN = "warn", "Предупреждение"
+        ENFORCE = "enforce", "Удаление"
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="forbidden_rules")
     encrypted_phrase = models.TextField()
     phrase_fingerprint = models.CharField(max_length=64)
     active = models.BooleanField(default=True)
+    direction = models.CharField(
+        max_length=16, choices=Direction.choices, default=Direction.BOTH
+    )
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.ENFORCE)
+    is_locked = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -124,12 +147,23 @@ class DisconnectRequest(models.Model):
 
 
 class FilterEvent(models.Model):
+    class Direction(models.TextChoices):
+        INCOMING = "incoming", "Входящее"
+        OUTGOING = "outgoing", "Исходящее"
+
     class Result(models.TextChoices):
+        DETECTED = "detected", "Обнаружено"
+        WARNED = "warned", "Предупреждение"
+        DELETED_SELF = "deleted_self", "Удалено для себя"
+        DELETED_ALL = "deleted_all", "Удалено для всех"
         DELETED = "deleted", "Удалено"
         FAILED = "failed", "Ошибка"
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="filter_events")
     rule_ids = models.JSONField(default=list)
+    direction = models.CharField(
+        max_length=16, choices=Direction.choices, default=Direction.OUTGOING
+    )
     source = models.CharField(max_length=16)
     chat_type = models.CharField(max_length=16)
     result = models.CharField(max_length=16, choices=Result.choices)
@@ -141,6 +175,22 @@ class FilterEvent(models.Model):
 
     def __str__(self) -> str:
         return f"Filter event #{self.pk}"
+
+    def get_source_display(self) -> str:
+        return {
+            "body": "текст",
+            "caption": "подпись",
+            "link_target": "ссылка",
+        }.get(self.source, self.source)
+
+    def get_chat_type_display(self) -> str:
+        return {
+            "saved": "Избранное",
+            "private": "личный чат",
+            "group": "группа",
+            "supergroup": "супергруппа",
+            "channel": "канал",
+        }.get(self.chat_type, self.chat_type)
 
 
 class MiniAppPolicy(models.Model):
@@ -257,9 +307,11 @@ class TelegramAuthFlow(models.Model):
         QR_READY = "qr_ready", "QR готов"
         CODE_REQUIRED = "code_required", "Нужен код"
         PASSWORD_REQUIRED = "password_required", "Нужен 2FA"
+        VERIFYING = "verifying", "Проверка"
         COMPLETE = "complete", "Готово"
         FAILED = "failed", "Ошибка"
         EXPIRED = "expired", "Истёк"
+        CANCELLED = "cancelled", "Отменено"
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="telegram_auth_flows")
     kind = models.CharField(max_length=8, choices=Kind.choices)
@@ -276,7 +328,12 @@ class TelegramAuthFlow(models.Model):
     @classmethod
     def new(cls, user: User, kind: str, encrypted_payload: str = "") -> TelegramAuthFlow:
         cls.objects.filter(user=user).exclude(
-            state__in=[cls.State.COMPLETE, cls.State.FAILED, cls.State.EXPIRED]
+            state__in=[
+                cls.State.COMPLETE,
+                cls.State.FAILED,
+                cls.State.EXPIRED,
+                cls.State.CANCELLED,
+            ]
         ).update(state=cls.State.EXPIRED, encrypted_payload="")
         return cls.objects.create(
             user=user,

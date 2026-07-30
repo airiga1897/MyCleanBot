@@ -34,7 +34,9 @@ def test_rule_is_encrypted_and_normalized_for_matching() -> None:
     user = User.objects.create_user("owner", password="long-test-password")
     rule = create_rule(user, "  Моя\nФраза ")
     assert "Моя" not in rule.encrypted_phrase
-    assert decrypted_rules(user) == [(rule.pk, "моя фраза")]
+    assert decrypted_rules(user) == [
+        (rule.pk, "моя фраза", ForbiddenRule.Mode.ENFORCE)
+    ]
 
 
 def test_duplicate_rule_is_rejected_after_normalization() -> None:
