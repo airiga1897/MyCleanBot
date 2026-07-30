@@ -82,6 +82,15 @@ if (statusRoot) {
     document.getElementById("stat-total").textContent = data.stats.total;
     document.getElementById("stat-successful").textContent = data.stats.successful;
     document.getElementById("stat-failed").textContent = data.stats.failed;
+    Object.entries(data.rule_scans || {}).forEach(([ruleId, scan]) => {
+      const root = document.getElementById(`rule-history-${ruleId}`);
+      if (!root) return;
+      ["status", "messages_scanned", "matches_found", "deleted_self", "failed_actions"]
+        .forEach((field) => {
+          const element = root.querySelector(`[data-field="${field}"]`);
+          if (element) element.textContent = scan[field];
+        });
+    });
     const historyRoot = document.querySelector(".history-status");
     if (historyRoot && data.history_scan) {
       const scan = data.history_scan;

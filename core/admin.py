@@ -12,9 +12,14 @@ from core.models import (
     MiniAppAuditEvent,
     MiniAppPolicy,
     MiniAppRule,
+    OperatorNotification,
+    RuleChangeRequest,
+    RuleDialogScope,
+    RulePattern,
     RuleRemovalRequest,
     TelegramAccount,
     TelegramAuthFlow,
+    TelegramDialog,
     UserKey,
     WorkerHeartbeat,
 )
@@ -27,6 +32,10 @@ for model, singular, plural in (
     (Invitation, "приглашение", "приглашения"),
     (TelegramAccount, "аккаунт Telegram", "аккаунты Telegram"),
     (ForbiddenRule, "правило текста", "правила текста"),
+    (RulePattern, "фраза правила", "фразы правил"),
+    (TelegramDialog, "диалог Telegram", "диалоги Telegram"),
+    (RuleDialogScope, "область правила", "области правил"),
+    (RuleChangeRequest, "запрос изменения правила", "запросы изменения правил"),
     (RuleRemovalRequest, "запрос удаления правила", "запросы удаления правил"),
     (DisconnectRequest, "запрос отключения", "запросы отключения"),
     (FilterEvent, "событие фильтра", "события фильтра"),
@@ -34,6 +43,7 @@ for model, singular, plural in (
     (MiniAppPolicy, "политика Mini Apps", "политики Mini Apps"),
     (MiniAppRule, "правило Mini Apps", "правила Mini Apps"),
     (MiniAppAuditEvent, "событие Mini Apps", "события Mini Apps"),
+    (OperatorNotification, "оповещение оператора", "оповещения оператора"),
     (WorkerHeartbeat, "служебный сигнал worker", "служебные сигналы worker"),
     (TelegramAuthFlow, "подключение Telegram", "подключения Telegram"),
 ):
@@ -247,8 +257,22 @@ class HistoryScanAdmin(admin.ModelAdmin):
 
 @admin.register(MiniAppPolicy)
 class MiniAppPolicyAdmin(admin.ModelAdmin):
-    list_display = ("account", "mode", "block_bot", "notify_user", "notify_admin", "updated_at")
-    readonly_fields = ("account", "mode", "block_bot", "notify_user", "notify_admin", "updated_at")
+    list_display = (
+        "account",
+        "mode",
+        "block_bot",
+        "notify_user",
+        "notify_operator",
+        "updated_at",
+    )
+    readonly_fields = (
+        "account",
+        "mode",
+        "block_bot",
+        "notify_user",
+        "notify_operator",
+        "updated_at",
+    )
 
     def has_add_permission(self, request: object) -> bool:
         return False
@@ -319,6 +343,78 @@ class TelegramAuthFlowAdmin(admin.ModelAdmin):
         "expires_at",
         "updated_at",
     )
+
+
+@admin.register(RulePattern)
+class RulePatternAdmin(admin.ModelAdmin):
+    list_display = ("id", "rule", "created_at")
+    readonly_fields = ("id", "rule", "phrase_fingerprint", "created_at")
+    exclude = ("encrypted_phrase",)
+
+
+@admin.register(TelegramDialog)
+class TelegramDialogAdmin(admin.ModelAdmin):
+    list_display = ("id", "account", "kind", "available", "last_seen_at")
+    readonly_fields = (
+        "id",
+        "account",
+        "peer_fingerprint",
+        "kind",
+        "available",
+        "last_seen_at",
+        "updated_at",
+    )
+    exclude = ("encrypted_label",)
+
+
+@admin.register(RuleDialogScope)
+class RuleDialogScopeAdmin(admin.ModelAdmin):
+    list_display = ("id", "rule", "dialog")
+    readonly_fields = ("id", "rule", "dialog")
+
+
+@admin.register(RuleChangeRequest)
+class RuleChangeRequestAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "rule", "status", "created_at", "resolved_at")
+    readonly_fields = (
+        "id",
+        "user",
+        "rule",
+        "change_summary",
+        "status",
+        "created_at",
+        "resolved_at",
+        "resolved_by",
+    )
+    exclude = ("encrypted_payload",)
+
+
+@admin.register(OperatorNotification)
+class OperatorNotificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "account",
+        "event_type",
+        "result",
+        "last_seen_at",
+        "repeat_count",
+        "processed_at",
+    )
+    readonly_fields = (
+        "id",
+        "account",
+        "rule",
+        "event_type",
+        "bot_id",
+        "bot_username",
+        "result",
+        "first_seen_at",
+        "last_seen_at",
+        "repeat_count",
+        "processed_at",
+        "processed_by",
+    )
+    exclude = ("dedup_key",)
     exclude = ("encrypted_payload",)
 
     def has_add_permission(self, request: object) -> bool:

@@ -3,11 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from django import forms
-from django.conf import settings
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
-from core.models import ForbiddenRule, MiniAppPolicy, MiniAppRule
+from core.models import ForbiddenRule, MiniAppPolicy, MiniAppRule, TelegramDialog
+from core.services.crypto import decrypt_for_user
 from core.services.miniapps import normalize_rule_value
 
 
@@ -17,12 +17,23 @@ class InviteRegistrationForm(UserCreationForm):  # type: ignore[type-arg]
         fields = ("username",)
 
 
+class TelegramDialogChoiceField(forms.ModelMultipleChoiceField):  # type: ignore[type-arg]
+    def label_from_instance(self, obj: TelegramDialog) -> str:
+        label = decrypt_for_user(obj.account.user, obj.encrypted_label)
+        return f"{label} · {obj.get_kind_display()}"
+
+
 class RuleForm(forms.Form):
-    phrase = forms.CharField(
-        label="Запрещённая фраза",
-        max_length=500,
+    label = forms.CharField(
+        label="Название правила",
+        max_length=120,
+        required=False,
+    )
+    phrases = forms.CharField(
+        label="Запрещённые фразы — по одной на строку",
+        max_length=4000,
         strip=True,
-        widget=forms.Textarea(attrs={"rows": 3}),
+        widget=forms.Textarea(attrs={"rows": 6}),
     )
     direction = forms.ChoiceField(
         label="Применять к сообщениям",
@@ -39,6 +50,41 @@ class RuleForm(forms.Form):
         initial=True,
         label="Защитить правило: удаление потребует подтверждения оператора",
     )
+    dialogs = TelegramDialogChoiceField(
+        label="Чаты и каналы",
+        queryset=TelegramDialog.objects.none(),
+        required=False,
+        help_text="Если ничего не выбрано, правило действует во всех чатах.",
+        widget=forms.SelectMultiple(attrs={"size": 10}),
+    )
+
+    def __init__(self, *args: Any, user: User, **kwargs: Any) -> None:
+        if args and args[0] is not None and "phrases" not in args[0] and "phrase" in args[0]:
+            data = args[0].copy()
+            data["phrases"] = args[0]["phrase"]
+            args = (data, *args[1:])
+        super().__init__(*args, **kwargs)
+        dialogs_field = self.fields["dialogs"]
+        if not isinstance(dialogs_field, forms.ModelMultipleChoiceField):
+            raise TypeError("dialogs field is not a ModelMultipleChoiceField")
+        dialogs_field.queryset = TelegramDialog.objects.filter(
+            account__user=user,
+            available=True,
+        )
+
+    def clean_phrases(self) -> str:
+        phrases = [
+            value.strip()
+            for value in str(self.cleaned_data["phrases"]).splitlines()
+            if value.strip()
+        ]
+        if not phrases:
+            raise forms.ValidationError("Добавьте хотя бы одну фразу.")
+        if len(phrases) > 50:
+            raise forms.ValidationError("В одном правиле допускается не более 50 фраз.")
+        if any(len(value) > 500 for value in phrases):
+            raise forms.ValidationError("Одна фраза не должна превышать 500 символов.")
+        return "\n".join(phrases)
 
 
 class RuleTestForm(forms.Form):
@@ -67,12 +113,12 @@ class MiniAppPolicyForm(forms.ModelForm):  # type: ignore[type-arg]
 
     class Meta:
         model = MiniAppPolicy
-        fields = ("mode", "block_bot", "notify_user", "notify_admin")
+        fields = ("mode", "block_bot", "notify_user", "notify_operator")
         labels = {
             "mode": "Режим",
             "block_bot": "Блокировать связанного бота в режиме ограничения",
             "notify_user": "Уведомлять пользователя в «Избранном»",
-            "notify_admin": "Уведомлять администратора минимальным email-событием",
+            "notify_operator": "Уведомлять оператора в кабинете",
         }
 
     def clean(self) -> dict[str, Any]:
@@ -85,14 +131,9 @@ class MiniAppPolicyForm(forms.ModelForm):  # type: ignore[type-arg]
         if (
             cleaned.get("mode") == MiniAppPolicy.Mode.WARN
             and not cleaned.get("notify_user")
-            and not cleaned.get("notify_admin")
+            and not cleaned.get("notify_operator")
         ):
             self.add_error("mode", "Для режима предупреждения выберите канал уведомления.")
-        if cleaned.get("notify_admin") and not settings.ADMINS:
-            self.add_error(
-                "notify_admin",
-                "Сначала оператор должен настроить MINI_APP_ADMIN_EMAILS.",
-            )
         return cleaned
 
 

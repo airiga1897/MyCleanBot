@@ -89,6 +89,8 @@ class ForbiddenRule(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="forbidden_rules")
     encrypted_phrase = models.TextField()
     phrase_fingerprint = models.CharField(max_length=64)
+    encrypted_label = models.TextField(blank=True)
+    revision = models.PositiveIntegerField(default=1)
     active = models.BooleanField(default=True)
     direction = models.CharField(
         max_length=16, choices=Direction.choices, default=Direction.BOTH
@@ -107,6 +109,115 @@ class ForbiddenRule(models.Model):
 
     def __str__(self) -> str:
         return f"Rule #{self.pk}"
+
+
+class RulePattern(models.Model):
+    rule = models.ForeignKey(
+        ForbiddenRule, on_delete=models.CASCADE, related_name="patterns"
+    )
+    encrypted_phrase = models.TextField()
+    phrase_fingerprint = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule", "phrase_fingerprint"],
+                name="unique_rule_pattern",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"Rule pattern #{self.pk}"
+
+
+class TelegramDialog(models.Model):
+    class Kind(models.TextChoices):
+        SAVED = "saved", "Избранное"
+        PRIVATE = "private", "Личный чат"
+        GROUP = "group", "Группа"
+        SUPERGROUP = "supergroup", "Супергруппа"
+        CHANNEL = "channel", "Канал"
+
+    account = models.ForeignKey(
+        TelegramAccount, on_delete=models.CASCADE, related_name="dialogs"
+    )
+    peer_fingerprint = models.CharField(max_length=64)
+    encrypted_label = models.TextField()
+    kind = models.CharField(max_length=16, choices=Kind.choices)
+    available = models.BooleanField(default=True)
+    last_seen_at = models.DateTimeField()
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["kind", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["account", "peer_fingerprint"],
+                name="unique_account_dialog",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"Telegram dialog #{self.pk}"
+
+
+class RuleDialogScope(models.Model):
+    rule = models.ForeignKey(
+        ForbiddenRule, on_delete=models.CASCADE, related_name="dialog_scopes"
+    )
+    dialog = models.ForeignKey(
+        TelegramDialog, on_delete=models.CASCADE, related_name="rule_scopes"
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule", "dialog"],
+                name="unique_rule_dialog_scope",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"Rule dialog scope #{self.pk}"
+
+
+class RuleChangeRequest(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает"
+        APPROVED = "approved", "Одобрен"
+        REJECTED = "rejected", "Отклонён"
+        CANCELLED = "cancelled", "Отменён пользователем"
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="rule_change_requests"
+    )
+    rule = models.ForeignKey(
+        ForbiddenRule, on_delete=models.CASCADE, related_name="change_requests"
+    )
+    encrypted_payload = models.TextField()
+    change_summary = models.JSONField(default=dict)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule"],
+                condition=models.Q(status="pending"),
+                name="unique_pending_rule_change",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"Rule change request #{self.pk}"
 
 
 class RuleRemovalRequest(models.Model):
@@ -212,6 +323,14 @@ class HistoryScan(models.Model):
         on_delete=models.CASCADE,
         related_name="history_scans",
     )
+    rule = models.ForeignKey(
+        ForbiddenRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="history_scans",
+    )
+    rule_revision = models.PositiveIntegerField(default=0)
     phase = models.CharField(max_length=16, choices=Phase.choices)
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.QUEUED)
     cancel_requested = models.BooleanField(default=False)
@@ -235,14 +354,8 @@ class HistoryScan(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["account"],
-                condition=models.Q(
-                    status__in=[
-                        "queued",
-                        "running",
-                        "awaiting_confirmation",
-                    ]
-                ),
-                name="unique_active_history_scan",
+                condition=models.Q(status="running"),
+                name="unique_running_history_scan",
             )
         ]
 
@@ -263,6 +376,7 @@ class MiniAppPolicy(models.Model):
     block_bot = models.BooleanField(default=False)
     notify_user = models.BooleanField(default=True)
     notify_admin = models.BooleanField(default=False)
+    notify_operator = models.BooleanField(default=False)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self) -> str:
@@ -343,6 +457,46 @@ class MiniAppAuditEvent(models.Model):
 
     def __str__(self) -> str:
         return f"Mini App audit event #{self.pk}"
+
+
+class OperatorNotification(models.Model):
+    account = models.ForeignKey(
+        TelegramAccount, on_delete=models.CASCADE, related_name="operator_notifications"
+    )
+    rule = models.ForeignKey(
+        MiniAppRule, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    event_type = models.CharField(
+        max_length=32,
+        choices=MiniAppAuditEvent.EventType.choices,
+    )
+    bot_id = models.BigIntegerField(null=True, blank=True)
+    bot_username = models.CharField(max_length=64, blank=True)
+    result = models.CharField(
+        max_length=16,
+        choices=MiniAppAuditEvent.Result.choices,
+    )
+    dedup_key = models.CharField(max_length=64)
+    first_seen_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField()
+    repeat_count = models.PositiveIntegerField(default=1)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    processed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+
+    class Meta:
+        ordering = ["-last_seen_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dedup_key"],
+                condition=models.Q(processed_at__isnull=True),
+                name="unique_open_operator_notification",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"Operator notification #{self.pk}"
 
 
 class WorkerHeartbeat(models.Model):

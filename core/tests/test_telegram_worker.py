@@ -77,9 +77,11 @@ async def test_database_helpers_encrypt_and_record() -> None:
     encrypted = await worker._encrypt(user, "secret")
     assert await worker._decrypt(user, encrypted) == "secret"
     rule = await worker.sync_to_async(create_rule)(user, "phrase")
-    assert await worker._load_rules(user, FilterEvent.Direction.OUTGOING) == [
-        (rule.pk, "phrase", ForbiddenRule.Mode.ENFORCE)
-    ]
+    rules = await worker._load_rules(user, FilterEvent.Direction.OUTGOING)
+    assert len(rules) == 1
+    assert rules[0].id == rule.pk
+    assert rules[0].phrases == ("phrase",)
+    assert rules[0].mode == ForbiddenRule.Mode.ENFORCE
 
     account = await TelegramAccount.objects.acreate(user=user, encrypted_session=encrypted)
     assert (await worker._account_snapshot())[0]["id"] == account.pk
@@ -273,6 +275,40 @@ async def test_observe_and_warn_modes_do_not_delete(
     assert warned.deleted == 0
     assert recorded[-1][5] == FilterEvent.Result.WARNED
     assert warnings == [[7]]
+
+
+async def test_rule_scope_only_matches_selected_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await User.objects.acreate_user(
+        "dialog-scope-user", password="long-password-123"
+    )
+    runner = worker.AccountRunner(
+        {"id": 42, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.user = user
+    selected_fingerprint = worker.peer_fingerprint(42, 100)
+
+    async def load_rules(_user: User, _direction: str) -> list[worker.RuleSpec]:
+        return [
+            worker.RuleSpec(
+                id=8,
+                phrases=("blocked",),
+                mode=ForbiddenRule.Mode.ENFORCE,
+                revision=1,
+                dialog_fingerprints=frozenset({selected_fingerprint}),
+            )
+        ]
+
+    monkeypatch.setattr(worker, "_load_rules", load_rules)
+    outside = DummyEvent("blocked", chat_id=200, outgoing=False)
+    selected = DummyEvent("blocked", chat_id=100, outgoing=False)
+
+    await runner._handle_message(outside)
+    await runner._handle_message(selected)
+
+    assert outside.deleted == 0
+    assert selected.deleted == 1
 
 
 class HistoryMessage:

@@ -17,6 +17,8 @@ from core.models import (
     MiniAppAuditEvent,
     MiniAppPolicy,
     MiniAppRule,
+    OperatorNotification,
+    RuleChangeRequest,
     RuleRemovalRequest,
     TelegramAccount,
     TelegramAuthFlow,
@@ -145,10 +147,7 @@ def test_user_cannot_cancel_another_users_removal(client: Client) -> None:
     )
 
 
-def test_history_scan_preview_confirm_cancel_and_isolation(
-    client: Client, settings: object
-) -> None:
-    settings.HISTORY_SCAN_REQUIRE_PREVIEW = True
+def test_history_scan_start_cancel_and_isolation(client: Client) -> None:
     owner = User.objects.create_user("history-owner", password="long-password-123")
     other = User.objects.create_user("history-other", password="long-password-123")
     account = TelegramAccount.objects.create(user=owner, encrypted_session="encrypted")
@@ -160,25 +159,10 @@ def test_history_scan_preview_confirm_cancel_and_isolation(
     started = client.post(reverse("start_history_scan"))
     assert started.status_code == 302
     scan = account.history_scans.get()
-    assert scan.phase == HistoryScan.Phase.PREVIEW
+    assert scan.phase == HistoryScan.Phase.ENFORCE
     assert scan.status == HistoryScan.Status.QUEUED
     assert client.post(reverse("start_history_scan")).status_code == 302
     assert account.history_scans.count() == 1
-
-    scan.status = HistoryScan.Status.AWAITING_CONFIRMATION
-    scan.matches_found = 7
-    scan.save(update_fields=["status", "matches_found"])
-    assert (
-        client.post(
-            reverse("confirm_history_scan", kwargs={"scan_id": scan.pk})
-        ).status_code
-        == 302
-    )
-    scan.refresh_from_db()
-    assert scan.phase == HistoryScan.Phase.ENFORCE
-    assert scan.status == HistoryScan.Status.QUEUED
-    assert scan.preview_matches == 7
-    assert scan.messages_scanned == 0
 
     assert (
         client.post(
@@ -201,15 +185,33 @@ def test_history_scan_preview_confirm_cancel_and_isolation(
     )
 
 
-def test_history_scan_can_skip_development_preview(
-    client: Client, settings: object
-) -> None:
-    settings.HISTORY_SCAN_REQUIRE_PREVIEW = False
+def test_history_scan_starts_directly_in_enforce(client: Client) -> None:
     user = User.objects.create_user("direct-history", password="long-password-123")
     account = TelegramAccount.objects.create(user=user, encrypted_session="encrypted")
     client.force_login(user)
     assert client.post(reverse("start_history_scan")).status_code == 302
     assert account.history_scans.get().phase == HistoryScan.Phase.ENFORCE
+
+
+def test_dashboard_status_includes_per_rule_history_progress(client: Client) -> None:
+    user = User.objects.create_user("rule-progress", password="long-password-123")
+    TelegramAccount.objects.create(user=user, encrypted_session="encrypted")
+    rule = create_rule(user, "история", queue_history=True)
+    scan = HistoryScan.objects.get(rule=rule)
+    scan.messages_scanned = 120
+    scan.matches_found = 4
+    scan.deleted_self = 3
+    scan.save(
+        update_fields=["messages_scanned", "matches_found", "deleted_self"]
+    )
+    client.force_login(user)
+
+    payload = client.get(reverse("dashboard_status")).json()
+
+    assert payload["rule_scans"][str(rule.pk)]["messages_scanned"] == 120
+    assert payload["rule_scans"][str(rule.pk)]["matches_found"] == 4
+    assert payload["rule_scans"][str(rule.pk)]["deleted_self"] == 3
+    assert payload["history_scan"]["id"] == scan.pk
 
 
 def test_disconnect_creates_request_without_disabling_account(client: Client) -> None:
@@ -236,7 +238,10 @@ def test_dashboard_masks_rules_and_isolates_user_data(client: Client) -> None:
     assert "hidden phrase" not in body
     own_rule = first.forbidden_rules.get()
     reveal = client.post(reverse("reveal_rule", kwargs={"rule_id": own_rule.pk}))
-    assert reveal.json() == {"phrase": "visible phrase"}
+    assert reveal.json() == {
+        "phrase": "visible phrase",
+        "phrases": ["visible phrase"],
+    }
     assert reveal.headers["Cache-Control"] == "no-store"
     other_rule = second.forbidden_rules.get()
     assert (
@@ -409,9 +414,7 @@ def test_add_mini_app_rule_validates_regex(client: Client) -> None:
     assert not MiniAppRule.objects.exists()
 
 
-def test_warn_policy_requires_a_configured_notification_channel(
-    client: Client, settings: object
-) -> None:
+def test_warn_policy_accepts_operator_dashboard_notifications(client: Client) -> None:
     user = User.objects.create_user("mini-warn-owner", password="long-password-123")
     account = TelegramAccount.objects.create(user=user)
     client.force_login(user)
@@ -420,12 +423,13 @@ def test_warn_policy_requires_a_configured_notification_channel(
         reverse("mini_app_settings"),
         {
             "mode": MiniAppPolicy.Mode.WARN,
-            "notify_admin": "on",
+            "notify_operator": "on",
         },
     )
-    assert response.status_code == 200
-    assert "MINI_APP_ADMIN_EMAILS" in response.content.decode()
-    assert MiniAppPolicy.objects.get(account=account).mode == MiniAppPolicy.Mode.OBSERVE
+    assert response.status_code == 302
+    policy = MiniAppPolicy.objects.get(account=account)
+    assert policy.mode == MiniAppPolicy.Mode.WARN
+    assert policy.notify_operator
 
 
 def test_qr_and_phone_auth_views(client: Client) -> None:
@@ -580,4 +584,97 @@ def test_operator_resolves_rule_and_disconnect_requests(client: Client) -> None:
     disconnect.refresh_from_db()
     account.refresh_from_db()
     assert disconnect.status == DisconnectRequest.Status.APPROVED
+    assert not account.desired_enabled
+
+
+def test_rule_edit_weakening_waits_for_operator_and_keeps_current_version(
+    client: Client,
+) -> None:
+    user = User.objects.create_user("edit-owner", password="long-password-123")
+    TelegramAccount.objects.create(user=user, encrypted_session="encrypted")
+    rule = create_rule(user, ["первая", "вторая"], is_locked=True)
+    client.force_login(user)
+
+    response = client.post(
+        reverse("edit_rule", kwargs={"rule_id": rule.pk}),
+        {
+            "label": "Изменённое правило",
+            "phrases": "первая",
+            "direction": ForbiddenRule.Direction.OUTGOING,
+            "mode": ForbiddenRule.Mode.WARN,
+        },
+    )
+
+    assert response.status_code == 302
+    change = RuleChangeRequest.objects.get(rule=rule)
+    assert change.status == RuleChangeRequest.Status.PENDING
+    rule.refresh_from_db()
+    assert rule.revision == 1
+    assert rule.mode == ForbiddenRule.Mode.ENFORCE
+
+
+def test_operator_can_close_one_or_all_visible_notifications(client: Client) -> None:
+    operator = User.objects.create_superuser(
+        "notification-operator",
+        "notification-operator@example.test",
+        "long-password-123",
+    )
+    owner = User.objects.create_user("notification-owner", password="long-password-123")
+    account = TelegramAccount.objects.create(user=owner)
+    items = [
+        OperatorNotification.objects.create(
+            account=account,
+            event_type=MiniAppAuditEvent.EventType.MENU_DETECTED,
+            result=MiniAppAuditEvent.Result.OBSERVED,
+            dedup_key=f"event-{index}",
+            first_seen_at=timezone.now(),
+            last_seen_at=timezone.now(),
+        )
+        for index in range(3)
+    ]
+    client.force_login(operator)
+
+    response = client.post(
+        reverse(
+            "process_operator_notification",
+            kwargs={"notification_id": items[0].pk},
+        )
+    )
+    assert response.status_code == 302
+    items[0].refresh_from_db()
+    assert items[0].processed_by == operator
+
+    response = client.post(
+        reverse("process_visible_notifications"),
+        {"notification_ids": f"{items[1].pk},{items[2].pk}"},
+    )
+    assert response.status_code == 302
+    assert (
+        OperatorNotification.objects.filter(
+            pk__in=[items[1].pk, items[2].pk],
+            processed_by=operator,
+            processed_at__isnull=False,
+        ).count()
+        == 2
+    )
+
+
+def test_operator_blocks_user_without_exposing_vpn_control_to_product(
+    client: Client,
+) -> None:
+    operator = User.objects.create_superuser(
+        "block-operator",
+        "block-operator@example.test",
+        "long-password-123",
+    )
+    owner = User.objects.create_user("blocked-owner", password="long-password-123")
+    account = TelegramAccount.objects.create(user=owner, desired_enabled=True)
+    client.force_login(operator)
+
+    response = client.post(reverse("block_user", kwargs={"user_id": owner.pk}))
+
+    assert response.status_code == 302
+    owner.refresh_from_db()
+    account.refresh_from_db()
+    assert not owner.is_active
     assert not account.desired_enabled
