@@ -613,6 +613,85 @@ def test_rule_edit_weakening_waits_for_operator_and_keeps_current_version(
     assert rule.mode == ForbiddenRule.Mode.ENFORCE
 
 
+def test_owner_can_cancel_pending_protected_rule_change(client: Client) -> None:
+    user = User.objects.create_user("cancel-change-owner", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    rule = create_rule(user, ["первая", "вторая"], is_locked=True)
+    client.force_login(user)
+    client.post(
+        reverse("edit_rule", kwargs={"rule_id": rule.pk}),
+        {
+            "label": "",
+            "phrases": "первая",
+            "direction": ForbiddenRule.Direction.OUTGOING,
+            "mode": ForbiddenRule.Mode.WARN,
+        },
+    )
+    change = RuleChangeRequest.objects.get(rule=rule)
+
+    response = client.post(
+        reverse("cancel_rule_change", kwargs={"rule_id": rule.pk})
+    )
+
+    assert response.status_code == 302
+    change.refresh_from_db()
+    assert change.status == RuleChangeRequest.Status.CANCELLED
+    assert change.resolved_at is not None
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status", "expected_mode"),
+    [
+        ("approve", RuleChangeRequest.Status.APPROVED, ForbiddenRule.Mode.WARN),
+        ("reject", RuleChangeRequest.Status.REJECTED, ForbiddenRule.Mode.ENFORCE),
+    ],
+)
+def test_operator_resolves_protected_rule_change(
+    client: Client,
+    decision: str,
+    expected_status: str,
+    expected_mode: str,
+) -> None:
+    operator = User.objects.create_superuser(
+        f"change-{decision}-operator",
+        f"change-{decision}@example.test",
+        "long-password-123",
+    )
+    owner = User.objects.create_user(
+        f"change-{decision}-owner", password="long-password-123"
+    )
+    TelegramAccount.objects.create(user=owner)
+    rule = create_rule(owner, ["первая", "вторая"], is_locked=True)
+    owner_client = Client()
+    owner_client.force_login(owner)
+    owner_client.post(
+        reverse("edit_rule", kwargs={"rule_id": rule.pk}),
+        {
+            "label": "Новое имя",
+            "phrases": "первая",
+            "direction": ForbiddenRule.Direction.OUTGOING,
+            "mode": ForbiddenRule.Mode.WARN,
+        },
+    )
+    change = RuleChangeRequest.objects.get(rule=rule)
+    client.force_login(operator)
+
+    response = client.post(
+        reverse(
+            "resolve_rule_change_request",
+            kwargs={"request_id": change.pk, "decision": decision},
+        )
+    )
+
+    assert response.status_code == 302
+    change.refresh_from_db()
+    rule.refresh_from_db()
+    assert change.status == expected_status
+    assert change.resolved_by == operator
+    assert rule.mode == expected_mode
+    assert rule.revision == (2 if decision == "approve" else 1)
+
+
 def test_operator_can_close_one_or_all_visible_notifications(client: Client) -> None:
     operator = User.objects.create_superuser(
         "notification-operator",

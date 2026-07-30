@@ -17,9 +17,11 @@ from core.models import (
     HistoryScan,
     TelegramAccount,
     TelegramAuthFlow,
+    TelegramDialog,
     WorkerHeartbeat,
 )
 from core.services import telegram_worker as worker
+from core.services.crypto import decrypt_for_user
 from core.services.rules import create_rule
 
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.asyncio]
@@ -97,6 +99,87 @@ async def test_database_helpers_encrypt_and_record() -> None:
     await worker._heartbeat()
     assert await FilterEvent.objects.filter(user=user).acount() == 1
     assert await WorkerHeartbeat.objects.filter(name="telegram-supervisor").aexists()
+
+
+async def test_dialog_catalog_sync_encrypts_labels_and_marks_missing_unavailable() -> None:
+    user = await User.objects.acreate_user(
+        "dialog-sync-user", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+
+    await worker._sync_dialog_catalog(
+        account.pk,
+        [
+            {"peer_id": 101, "label": "Личный чат", "kind": TelegramDialog.Kind.PRIVATE},
+            {"peer_id": 202, "label": "Рабочая группа", "kind": TelegramDialog.Kind.GROUP},
+        ],
+    )
+
+    dialogs = [
+        item
+        async for item in TelegramDialog.objects.filter(account=account).order_by("id")
+    ]
+    assert len(dialogs) == 2
+    assert "Личный чат" not in dialogs[0].encrypted_label
+    assert (
+        await worker.sync_to_async(decrypt_for_user)(user, dialogs[0].encrypted_label)
+        == "Личный чат"
+    )
+    assert all(item.available for item in dialogs)
+
+    await worker._sync_dialog_catalog(
+        account.pk,
+        [{"peer_id": 202, "label": "Группа переименована", "kind": TelegramDialog.Kind.GROUP}],
+    )
+
+    await dialogs[0].arefresh_from_db()
+    await dialogs[1].arefresh_from_db()
+    assert not dialogs[0].available
+    assert dialogs[1].available
+    assert (
+        await worker.sync_to_async(decrypt_for_user)(user, dialogs[1].encrypted_label)
+        == "Группа переименована"
+    )
+
+
+async def test_account_runner_synchronizes_dialogs_and_tolerates_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await User.objects.acreate_user(
+        "runner-dialog-user", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": ""}
+    )
+    runner.own_id = 77
+
+    class DialogClient:
+        async def iter_dialogs(self) -> Any:
+            yield SimpleNamespace(id=77, name="Me", is_user=True, is_channel=False)
+            yield SimpleNamespace(
+                id=88,
+                name="Команда",
+                is_user=False,
+                is_channel=True,
+                entity=SimpleNamespace(megagroup=True),
+            )
+
+    runner.client = DialogClient()  # type: ignore[assignment]
+    await runner._maybe_sync_dialogs()
+    assert await TelegramDialog.objects.filter(account=account).acount() == 2
+
+    runner.next_dialog_sync_at = 0
+
+    class BrokenDialogClient:
+        async def iter_dialogs(self) -> Any:
+            if False:
+                yield None
+            raise ConnectionError("safe test failure")
+
+    runner.client = BrokenDialogClient()  # type: ignore[assignment]
+    await runner._maybe_sync_dialogs()
+    assert runner.next_dialog_sync_at > 0
 
     await worker._clear_account_session(account.pk)
     await account.arefresh_from_db()
