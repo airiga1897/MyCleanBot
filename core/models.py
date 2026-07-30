@@ -114,6 +114,7 @@ class RuleRemovalRequest(models.Model):
         PENDING = "pending", "Ожидает"
         APPROVED = "approved", "Одобрен"
         REJECTED = "rejected", "Отклонён"
+        CANCELLED = "cancelled", "Отменён пользователем"
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="rule_removal_requests")
     rule = models.ForeignKey(ForbiddenRule, on_delete=models.SET_NULL, null=True)
@@ -191,6 +192,62 @@ class FilterEvent(models.Model):
             "supergroup": "супергруппа",
             "channel": "канал",
         }.get(self.chat_type, self.chat_type)
+
+
+class HistoryScan(models.Model):
+    class Phase(models.TextChoices):
+        PREVIEW = "preview", "Предварительная проверка"
+        ENFORCE = "enforce", "Удаление"
+
+    class Status(models.TextChoices):
+        QUEUED = "queued", "В очереди"
+        RUNNING = "running", "Проверяется"
+        AWAITING_CONFIRMATION = "awaiting_confirmation", "Ожидает подтверждения"
+        COMPLETED = "completed", "Завершено"
+        CANCELLED = "cancelled", "Остановлено"
+        FAILED = "failed", "Ошибка"
+
+    account = models.ForeignKey(
+        TelegramAccount,
+        on_delete=models.CASCADE,
+        related_name="history_scans",
+    )
+    phase = models.CharField(max_length=16, choices=Phase.choices)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.QUEUED)
+    cancel_requested = models.BooleanField(default=False)
+    dialogs_scanned = models.PositiveIntegerField(default=0)
+    message_offset_id = models.BigIntegerField(default=0)
+    messages_scanned = models.PositiveBigIntegerField(default=0)
+    matches_found = models.PositiveBigIntegerField(default=0)
+    preview_matches = models.PositiveBigIntegerField(default=0)
+    deleted_self = models.PositiveBigIntegerField(default=0)
+    skipped_global = models.PositiveBigIntegerField(default=0)
+    failed_actions = models.PositiveBigIntegerField(default=0)
+    last_error_code = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["account"],
+                condition=models.Q(
+                    status__in=[
+                        "queued",
+                        "running",
+                        "awaiting_confirmation",
+                    ]
+                ),
+                name="unique_active_history_scan",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"History scan #{self.pk}"
 
 
 class MiniAppPolicy(models.Model):

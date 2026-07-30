@@ -36,6 +36,7 @@ from core.models import (
     DisconnectRequest,
     FilterEvent,
     ForbiddenRule,
+    HistoryScan,
     Invitation,
     MiniAppPolicy,
     MiniAppRule,
@@ -63,12 +64,14 @@ def dashboard(request: HttpRequest) -> HttpResponse:
     account, _ = TelegramAccount.objects.get_or_create(user=user)
     rules = user.forbidden_rules.all()
     rules_page = Paginator(rules, 20).get_page(request.GET.get("page"))
-    pending_rule_ids = set(
-        user.rule_removal_requests.filter(
+    pending_rule_requests = {
+        item.rule_id: item.pk
+        for item in user.rule_removal_requests.filter(
             status=RuleRemovalRequest.Status.PENDING,
             rule_id__isnull=False,
-        ).values_list("rule_id", flat=True)
-    )
+        )
+    }
+    history_scan = account.history_scans.first()
     events = user.filter_events.all()[:50]
     since = timezone.now() - timedelta(hours=24)
     event_stats = user.filter_events.filter(created_at__gte=since).aggregate(
@@ -94,7 +97,19 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         {
             "account": account,
             "rules_page": rules_page,
-            "pending_rule_ids": pending_rule_ids,
+            "pending_rule_ids": set(pending_rule_requests),
+            "history_scan": history_scan,
+            "history_scan_require_preview": settings.HISTORY_SCAN_REQUIRE_PREVIEW,
+            "can_start_history_scan": bool(account.encrypted_session)
+            and (
+                history_scan is None
+                or history_scan.status
+                in {
+                    HistoryScan.Status.COMPLETED,
+                    HistoryScan.Status.CANCELLED,
+                    HistoryScan.Status.FAILED,
+                }
+            ),
             "events": events,
             "event_stats": event_stats,
             "pending_disconnect": pending_disconnect,
@@ -122,6 +137,7 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
         ),
         failed=Count("id", filter=Q(result=FilterEvent.Result.FAILED)),
     )
+    history_scan = account.history_scans.first()
     return JsonResponse(
         {
             "account": {
@@ -136,6 +152,23 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
                 "last_update_result": account.last_update_result,
             },
             "stats": stats,
+            "history_scan": (
+                {
+                    "id": history_scan.pk,
+                    "phase": history_scan.get_phase_display(),
+                    "status": history_scan.get_status_display(),
+                    "status_code": history_scan.status,
+                    "dialogs_scanned": history_scan.dialogs_scanned,
+                    "messages_scanned": history_scan.messages_scanned,
+                    "matches_found": history_scan.matches_found,
+                    "preview_matches": history_scan.preview_matches,
+                    "deleted_self": history_scan.deleted_self,
+                    "skipped_global": history_scan.skipped_global,
+                    "failed_actions": history_scan.failed_actions,
+                }
+                if history_scan
+                else None
+            ),
             "events": [
                 {
                     "created_at": event.created_at.isoformat(),
@@ -207,6 +240,112 @@ def request_rule_removal(request: HttpRequest, rule_id: int) -> HttpResponse:
     else:
         rule.delete()
         messages.success(request, "Правило удалено.")
+    return redirect("dashboard")
+
+
+@login_required
+@require_POST
+def cancel_rule_removal(request: HttpRequest, rule_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    removal = get_object_or_404(
+        RuleRemovalRequest,
+        user=user,
+        rule_id=rule_id,
+        status=RuleRemovalRequest.Status.PENDING,
+    )
+    removal.status = RuleRemovalRequest.Status.CANCELLED
+    removal.resolved_at = timezone.now()
+    removal.resolved_by = None
+    removal.save(update_fields=["status", "resolved_at", "resolved_by"])
+    messages.success(request, "Запрос на удаление правила отменён.")
+    return redirect("dashboard")
+
+
+@login_required
+@require_POST
+@transaction.atomic
+def start_history_scan(request: HttpRequest) -> HttpResponse:
+    user = _authenticated_user(request)
+    account = get_object_or_404(
+        TelegramAccount.objects.select_for_update(),
+        user=user,
+    )
+    if not account.encrypted_session:
+        messages.error(request, "Сначала подключите Telegram.")
+        return redirect("dashboard")
+    active = account.history_scans.filter(
+        status__in=[
+            HistoryScan.Status.QUEUED,
+            HistoryScan.Status.RUNNING,
+            HistoryScan.Status.AWAITING_CONFIRMATION,
+        ]
+    ).exists()
+    if active:
+        messages.error(request, "Проверка истории уже выполняется.")
+        return redirect("dashboard")
+    phase = (
+        HistoryScan.Phase.PREVIEW
+        if settings.HISTORY_SCAN_REQUIRE_PREVIEW
+        else HistoryScan.Phase.ENFORCE
+    )
+    HistoryScan.objects.create(account=account, phase=phase)
+    messages.success(request, "Полная проверка истории поставлена в очередь.")
+    return redirect("dashboard")
+
+
+@login_required
+@require_POST
+@transaction.atomic
+def confirm_history_scan(request: HttpRequest, scan_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    scan = get_object_or_404(
+        HistoryScan.objects.select_for_update(),
+        pk=scan_id,
+        account__user=user,
+        phase=HistoryScan.Phase.PREVIEW,
+        status=HistoryScan.Status.AWAITING_CONFIRMATION,
+    )
+    scan.preview_matches = scan.matches_found
+    scan.phase = HistoryScan.Phase.ENFORCE
+    scan.status = HistoryScan.Status.QUEUED
+    scan.cancel_requested = False
+    scan.dialogs_scanned = 0
+    scan.message_offset_id = 0
+    scan.messages_scanned = 0
+    scan.matches_found = 0
+    scan.deleted_self = 0
+    scan.skipped_global = 0
+    scan.failed_actions = 0
+    scan.last_error_code = ""
+    scan.confirmed_at = timezone.now()
+    scan.started_at = None
+    scan.completed_at = None
+    scan.save()
+    messages.success(request, "Удаление найденных совпадений поставлено в очередь.")
+    return redirect("dashboard")
+
+
+@login_required
+@require_POST
+@transaction.atomic
+def cancel_history_scan(request: HttpRequest, scan_id: int) -> HttpResponse:
+    user = _authenticated_user(request)
+    scan = get_object_or_404(
+        HistoryScan.objects.select_for_update(),
+        pk=scan_id,
+        account__user=user,
+        status__in=[
+            HistoryScan.Status.QUEUED,
+            HistoryScan.Status.RUNNING,
+            HistoryScan.Status.AWAITING_CONFIRMATION,
+        ],
+    )
+    scan.cancel_requested = True
+    if scan.status != HistoryScan.Status.RUNNING:
+        scan.status = HistoryScan.Status.CANCELLED
+        scan.completed_at = timezone.now()
+    scan.save(update_fields=["cancel_requested", "status", "completed_at", "updated_at"])
+    messages.success(request, "Остановка фоновой проверки запрошена.")
     return redirect("dashboard")
 
 

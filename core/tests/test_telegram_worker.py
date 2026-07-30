@@ -14,6 +14,7 @@ from telethon.errors import AuthKeyUnregisteredError, SessionPasswordNeededError
 from core.models import (
     FilterEvent,
     ForbiddenRule,
+    HistoryScan,
     TelegramAccount,
     TelegramAuthFlow,
     WorkerHeartbeat,
@@ -272,6 +273,188 @@ async def test_observe_and_warn_modes_do_not_delete(
     assert warned.deleted == 0
     assert recorded[-1][5] == FilterEvent.Result.WARNED
     assert warnings == [[7]]
+
+
+class HistoryMessage:
+    def __init__(self, message_id: int, text: str, *, outgoing: bool = False) -> None:
+        self.id = message_id
+        self.raw_text = text
+        self.out = outgoing
+        self.entities: list[Any] = []
+        self.media = None
+        self.deleted = False
+        self.revoke: bool | None = None
+
+    async def delete(self, *, revoke: bool) -> None:
+        self.deleted = True
+        self.revoke = revoke
+
+
+class HistoryClient:
+    def __init__(self) -> None:
+        self.private_messages = [
+            HistoryMessage(9, "ordinary"),
+            HistoryMessage(8, "contains blocked marker"),
+        ]
+        self.channel_messages = [HistoryMessage(7, "blocked marker")]
+        self.dialogs = [
+            SimpleNamespace(
+                id=100,
+                input_entity="private",
+                is_user=True,
+                is_channel=False,
+                entity=SimpleNamespace(megagroup=False),
+            ),
+            SimpleNamespace(
+                id=-200,
+                input_entity="channel",
+                is_user=False,
+                is_channel=True,
+                entity=SimpleNamespace(megagroup=False),
+            ),
+        ]
+        self.offsets: list[tuple[str, int]] = []
+
+    async def iter_dialogs(self) -> Any:
+        for dialog in self.dialogs:
+            yield dialog
+
+    async def iter_messages(self, entity: str, *, offset_id: int) -> Any:
+        self.offsets.append((entity, offset_id))
+        messages = (
+            self.private_messages if entity == "private" else self.channel_messages
+        )
+        for message in messages:
+            if not offset_id or message.id < offset_id:
+                yield message
+
+
+async def test_full_history_preview_then_safe_enforcement(
+    monkeypatch: pytest.MonkeyPatch, settings: Any
+) -> None:
+    settings.HISTORY_SCAN_BATCH_SIZE = 1
+    settings.HISTORY_SCAN_YIELD_SECONDS = 0
+    user = await User.objects.acreate_user(
+        "history-worker", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(
+        user=user, encrypted_session="encrypted"
+    )
+    await worker.sync_to_async(create_rule)(user, "blocked marker")
+    scan = await HistoryScan.objects.acreate(
+        account=account,
+        phase=HistoryScan.Phase.PREVIEW,
+    )
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.user = user
+    runner.own_id = 999
+    preview_client = HistoryClient()
+    runner.client = preview_client  # type: ignore[assignment]
+
+    claimed = await worker._claim_history_scan(account.pk)
+    assert claimed is not None
+    await runner._scan_history(claimed)
+    await scan.arefresh_from_db()
+    assert scan.status == HistoryScan.Status.AWAITING_CONFIRMATION
+    assert scan.dialogs_scanned == 2
+    assert scan.messages_scanned == 3
+    assert scan.matches_found == 2
+    assert not any(message.deleted for message in preview_client.private_messages)
+
+    scan.preview_matches = scan.matches_found
+    scan.phase = HistoryScan.Phase.ENFORCE
+    scan.status = HistoryScan.Status.QUEUED
+    scan.dialogs_scanned = 0
+    scan.message_offset_id = 0
+    scan.messages_scanned = 0
+    scan.matches_found = 0
+    await scan.asave()
+    enforce_client = HistoryClient()
+    runner.client = enforce_client  # type: ignore[assignment]
+
+    claimed = await worker._claim_history_scan(account.pk)
+    assert claimed is not None
+    await runner._scan_history(claimed)
+    await scan.arefresh_from_db()
+    assert scan.status == HistoryScan.Status.COMPLETED
+    assert scan.preview_matches == 2
+    assert scan.matches_found == 2
+    assert scan.deleted_self == 1
+    assert scan.skipped_global == 1
+    matched_private = enforce_client.private_messages[1]
+    assert matched_private.deleted
+    assert matched_private.revoke is False
+    assert not enforce_client.channel_messages[0].deleted
+
+
+async def test_history_scan_resumes_from_sanitized_cursor(settings: Any) -> None:
+    settings.HISTORY_SCAN_BATCH_SIZE = 10
+    settings.HISTORY_SCAN_YIELD_SECONDS = 0
+    user = await User.objects.acreate_user(
+        "history-resume", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(
+        user=user, encrypted_session="encrypted"
+    )
+    await worker.sync_to_async(create_rule)(user, "blocked marker")
+    scan = await HistoryScan.objects.acreate(
+        account=account,
+        phase=HistoryScan.Phase.PREVIEW,
+        status=HistoryScan.Status.RUNNING,
+        dialogs_scanned=1,
+        message_offset_id=8,
+    )
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.user = user
+    runner.own_id = 999
+    history_client = HistoryClient()
+    runner.client = history_client  # type: ignore[assignment]
+
+    claimed = await worker._claim_history_scan(account.pk)
+    assert claimed is not None
+    await runner._scan_history(claimed)
+    await scan.arefresh_from_db()
+    assert history_client.offsets == [("channel", 8)]
+    assert scan.messages_scanned == 1
+    assert scan.matches_found == 1
+
+
+async def test_history_scan_honours_background_cancellation(
+    monkeypatch: pytest.MonkeyPatch, settings: Any
+) -> None:
+    settings.HISTORY_SCAN_BATCH_SIZE = 1
+    settings.HISTORY_SCAN_YIELD_SECONDS = 0
+    user = await User.objects.acreate_user(
+        "history-stop", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(
+        user=user, encrypted_session="encrypted"
+    )
+    await worker.sync_to_async(create_rule)(user, "blocked marker")
+    scan = await HistoryScan.objects.acreate(
+        account=account,
+        phase=HistoryScan.Phase.PREVIEW,
+    )
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.user = user
+    runner.client = HistoryClient()  # type: ignore[assignment]
+
+    async def cancelled(_scan_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(worker, "_history_scan_cancel_requested", cancelled)
+    claimed = await worker._claim_history_scan(account.pk)
+    assert claimed is not None
+    await runner._scan_history(claimed)
+    await scan.arefresh_from_db()
+    assert scan.status == HistoryScan.Status.CANCELLED
+    assert scan.messages_scanned == 1
 
 
 async def test_status_command_is_ephemeral_and_other_messages_are_ignored(
