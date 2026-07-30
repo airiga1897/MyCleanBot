@@ -6,15 +6,21 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}MyCleanBot{% endblock %}</title>
   <link rel="stylesheet" href="{% static 'app.css' %}">
+  <script src="{% static 'app.js' %}" defer></script>
 </head>
 <body>
-  <header>
-    <a href="{% url 'dashboard' %}">MyCleanBot</a>
+  <header class="site-header">
+    <a class="brand" href="{% url 'dashboard' %}">MyCleanBot</a>
     {% if user.is_authenticated %}
-      <span>{{ user.username }}</span>
+      <nav aria-label="Основное меню">
+        <a href="{% url 'dashboard' %}">Личный кабинет</a>
+        <a href="{% url 'mini_app_settings' %}">Mini Apps</a>
+        {% if user.is_staff %}<a href="{% url 'operator_dashboard' %}">Оператор</a>{% endif %}
+      </nav>
+      <span class="username">{{ user.username }}</span>
       <form action="{% url 'logout' %}" method="post">
         {% csrf_token %}
-        <button type="submit">Выйти</button>
+        <button class="secondary" type="submit">Выйти</button>
       </form>
     {% endif %}
   </header>
@@ -24,4 +30,3 @@
   </main>
 </body>
 </html>
-

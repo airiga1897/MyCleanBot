@@ -15,9 +15,13 @@
 - Tenant-owned querysets обязательны для пользовательских endpoints.
 - Phrase, MTProto session, phone, OTP и 2FA не логируются.
 - Phrase/session — envelope encrypted; transient auth secrets имеют TTL пять минут.
+- Отменённый или заменённый auth flow не может сохранить запоздавшую session.
 - Mini App rules принадлежат конкретному `TelegramAccount`; текстовые значения шифруются.
 - Mini App audit не содержит полный текст сообщений, session или WebView content.
-- Пользователь может добавлять правило, но removal/disconnect требует operator approval.
+- Открытая фраза не включается в HTML списка и выдаётся только отдельным
+  авторизованным `no-store` запросом.
+- Пользователь может удалить обычное правило сразу; protected removal и disconnect
+  требуют operator approval.
 
 ## Тестирование
 
@@ -28,6 +32,8 @@
 - Минимум 95% coverage для matcher/deletion/security и 85% по `core`.
 - Обязательны negative tenant tests, auth lifecycle mocks, URL cases, retry behavior
   и проверка отсутствия sensitive logging.
+- Обязательна матрица входящих/исходящих новых сообщений и edits для private chat,
+  basic group, supergroup и channel с наличием и отсутствием права удаления.
 - MTProto Mini App operations тестируются только через mock client; CI не использует
   реальные Telegram credentials или аккаунты.
 - CI использует временный PostgreSQL; production database не используется.
@@ -46,7 +52,9 @@
 
 Публичного REST API нет. Интерфейсы v1:
 
-- Django web cabinet и operator admin;
+- Django web cabinet и русскоязычный `/operator/`;
+- Django Admin как резервный технический интерфейс;
+- собранная статика через WhiteNoise при `DJANGO_DEBUG=false`;
 - `/livez` — process liveness;
 - `/healthz` — database и worker readiness;
 - PostgreSQL heartbeat между web и worker;

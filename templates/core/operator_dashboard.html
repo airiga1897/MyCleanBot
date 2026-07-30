@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Кабинет оператора — MyCleanBot{% endblock %}
+{% block content %}
+<div class="row wrap">
+  <div>
+    <h1>Кабинет оператора</h1>
+    <p class="muted">Пользователи, приглашения и запросы подтверждения.</p>
+  </div>
+  {% if available %}
+    <a class="button" href="{% url 'create_invitation' %}">Создать приглашение</a>
+  {% endif %}
+</div>
+
+<section class="card">
+  <h2>Места</h2>
+  <div class="stats">
+    <div><strong>{{ occupied }}</strong><span>активных пользователей</span></div>
+    <div><strong>{{ available }}</strong><span>свободных мест</span></div>
+    <div><strong>10</strong><span>общий лимит</span></div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Пользователи</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Логин</th><th>Роль</th><th>Telegram</th><th>Последний сигнал</th></tr></thead>
+      <tbody>
+      {% for item in users %}
+        <tr>
+          <td>{{ item.username }}</td>
+          <td>{% if item.is_staff %}оператор{% else %}пользователь{% endif %}</td>
+          <td>{{ item.telegram_account.get_status_display|default:"не подключён" }}</td>
+          <td>{{ item.telegram_account.last_heartbeat_at|default:"—" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Приглашения</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Создано</th><th>Действует до</th><th>Состояние</th><th>Действие</th></tr></thead>
+      <tbody>
+      {% for invitation in invitations %}
+        <tr>
+          <td>{{ invitation.created_at }}</td>
+          <td>{{ invitation.expires_at }}</td>
+          <td>
+            {% if invitation.consumed_at %}использовано
+            {% elif invitation.revoked_at %}отозвано
+            {% elif invitation.expires_at <= now %}истекло
+            {% else %}активно{% endif %}
+          </td>
+          <td>
+            {% if not invitation.consumed_at and not invitation.revoked_at and invitation.expires_at > now %}
+              <form method="post" action="{% url 'revoke_invitation' invitation.id %}">
+                {% csrf_token %}<button class="danger" type="submit">Отозвать</button>
+              </form>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% empty %}<tr><td colspan="4">Приглашений пока нет.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Удаление защищённых правил</h2>
+  {% for item in rule_requests %}
+    <div class="request-row">
+      <span>{{ item.user.username }} · правило #{{ item.rule_id }} · {{ item.created_at }}</span>
+      <div class="actions">
+        <form method="post" action="{% url 'resolve_rule_removal' item.id 'approve' %}">
+          {% csrf_token %}<button type="submit">Одобрить</button>
+        </form>
+        <form method="post" action="{% url 'resolve_rule_removal' item.id 'reject' %}">
+          {% csrf_token %}<button class="secondary" type="submit">Отклонить</button>
+        </form>
+      </div>
+    </div>
+  {% empty %}<p>Ожидающих запросов нет.</p>{% endfor %}
+</section>
+
+<section class="card">
+  <h2>Отключение Telegram</h2>
+  {% for item in disconnect_requests %}
+    <div class="request-row">
+      <span>{{ item.user.username }} · {{ item.created_at }}</span>
+      <div class="actions">
+        <form method="post" action="{% url 'resolve_disconnect' item.id 'approve' %}">
+          {% csrf_token %}<button type="submit">Одобрить</button>
+        </form>
+        <form method="post" action="{% url 'resolve_disconnect' item.id 'reject' %}">
+          {% csrf_token %}<button class="secondary" type="submit">Отклонить</button>
+        </form>
+      </div>
+    </div>
+  {% empty %}<p>Ожидающих запросов нет.</p>{% endfor %}
+</section>
+
+<p><a href="{% url 'admin:index' %}">Техническое администрирование Django</a></p>
+{% endblock %}

@@ -22,6 +22,7 @@ dependencies = [
   "psycopg[binary]>=3.2,<4",
   "qrcode[pil]>=8.2,<9",
   "uvicorn>=0.34,<1",
+  "whitenoise>=6.9,<7",
 ]
 
 [dependency-groups]

@@ -19,6 +19,7 @@ from telethon.tl import functions, types
 
 from core.models import (
     FilterEvent,
+    ForbiddenRule,
     MiniAppAuditEvent,
     MiniAppPolicy,
     TelegramAccount,
@@ -39,7 +40,12 @@ from core.services.rules import decrypted_rules
 
 logger = logging.getLogger(__name__)
 MINI_APP_WARNING_PREFIX = "⚠️ MyCleanBot:"
+FILTER_WARNING_PREFIX = "⚠️ MyCleanBot: правило текста"
 _BARE_BOT_COMMAND = "/"
+
+
+class AuthFlowCancelled(Exception):
+    pass
 
 
 def _lock_key(account_id: int) -> int:
@@ -101,8 +107,8 @@ def _load_user(user_id: int) -> User:
 
 
 @sync_to_async
-def _load_rules(user: User) -> list[tuple[int, str]]:
-    return decrypted_rules(user)
+def _load_rules(user: User, direction: str) -> list[tuple[int, str, str]]:
+    return decrypted_rules(user, direction)
 
 
 @sync_to_async
@@ -119,6 +125,7 @@ def _decrypt(user: User, value: str) -> str:
 def _record_event(
     user_id: int,
     rule_ids: list[int],
+    direction: str,
     source: str,
     chat_type: str,
     result: str,
@@ -127,10 +134,20 @@ def _record_event(
     FilterEvent.objects.create(
         user_id=user_id,
         rule_ids=rule_ids,
+        direction=direction,
         source=source,
         chat_type=chat_type,
         result=result,
         error_code=error_code[:64],
+    )
+
+
+@sync_to_async
+def _record_account_update(account_id: int, direction: str, result: str) -> None:
+    TelegramAccount.objects.filter(pk=account_id).update(
+        last_update_at=timezone.now(),
+        last_update_direction=direction,
+        last_update_result=result[:32],
     )
 
 
@@ -210,6 +227,8 @@ def _chat_type(event: Any, own_id: int) -> str:
         return "saved"
     if event.is_private:
         return "private"
+    if event.is_channel and bool(getattr(event, "is_group", False)):
+        return "supergroup"
     if event.is_channel:
         return "channel"
     return "group"
@@ -279,8 +298,8 @@ class AccountRunner:
             return
         me = await self.client.get_me()
         self.own_id = int(me.id)
-        self.client.add_event_handler(self._handle_message, events.NewMessage(outgoing=True))
-        self.client.add_event_handler(self._handle_message, events.MessageEdited(outgoing=True))
+        self.client.add_event_handler(self._handle_message, events.NewMessage())
+        self.client.add_event_handler(self._handle_message, events.MessageEdited())
         self.client.add_event_handler(
             self._handle_attach_menu_update,
             events.Raw(types.UpdateAttachMenuBots),
@@ -300,17 +319,29 @@ class AccountRunner:
     async def _handle_message(self, event: Any) -> None:
         if not self.user:
             return
+        is_outgoing = bool(
+            getattr(event, "out", getattr(event.message, "out", False))
+        )
+        direction = (
+            FilterEvent.Direction.OUTGOING
+            if is_outgoing
+            else FilterEvent.Direction.INCOMING
+        )
+        await _record_account_update(int(self.account["id"]), direction, "received")
         message_key = (int(event.chat_id or 0), int(event.message.id))
         if message_key in self.service_messages:
             return
         text = event.raw_text or ""
-        if text.startswith(MINI_APP_WARNING_PREFIX):
+        if text.startswith((MINI_APP_WARNING_PREFIX, FILTER_WARNING_PREFIX)):
             return
         saved = int(event.chat_id or 0) == self.own_id
-        if is_status_command(text, saved):
+        if direction == FilterEvent.Direction.OUTGOING and is_status_command(text, saved):
             await self._show_status(event, message_key)
             return
-        if await self._handle_mini_app_message(event, text):
+        if (
+            direction == FilterEvent.Direction.OUTGOING
+            and await self._handle_mini_app_message(event, text)
+        ):
             return
         candidates = extract_candidates(text, event.message.entities)
         if event.message.media:
@@ -318,8 +349,14 @@ class AccountRunner:
                 TextCandidate("caption" if item.source == "body" else item.source, item.value)
                 for item in candidates
             ]
-        matches = find_matches(candidates, await _load_rules(self.user))
+        rules = await _load_rules(self.user, direction)
+        rule_modes = {rule_id: mode for rule_id, _phrase, mode in rules}
+        matches = find_matches(
+            candidates,
+            [(rule_id, phrase) for rule_id, phrase, _mode in rules],
+        )
         if not matches:
+            await _record_account_update(int(self.account["id"]), direction, "no_match")
             return
         rule_ids = sorted({match.rule_id for match in matches})
         source = (
@@ -328,12 +365,32 @@ class AccountRunner:
             else matches[0].source
         )
         chat_type = _chat_type(event, self.own_id)
+        modes = {rule_modes[rule_id] for rule_id in rule_ids}
+        if ForbiddenRule.Mode.ENFORCE not in modes:
+            result: str = (
+                FilterEvent.Result.WARNED
+                if ForbiddenRule.Mode.WARN in modes
+                else FilterEvent.Result.DETECTED
+            )
+            await _record_event(
+                self.user.pk,
+                rule_ids,
+                direction,
+                source,
+                chat_type,
+                result,
+            )
+            await _record_account_update(int(self.account["id"]), direction, result)
+            if result == FilterEvent.Result.WARNED:
+                await self._notify_filter_warning(rule_ids)
+            return
         try:
-            await self._delete_with_retry(event)
+            result = await self._delete_matched_message(event, direction, chat_type)
         except Exception as exc:
             await _record_event(
                 self.user.pk,
                 rule_ids,
+                direction,
                 source,
                 chat_type,
                 FilterEvent.Result.FAILED,
@@ -344,10 +401,47 @@ class AccountRunner:
                 self.user.pk,
                 exc.__class__.__name__,
             )
+            await _record_account_update(
+                int(self.account["id"]), direction, FilterEvent.Result.FAILED
+            )
         else:
             await _record_event(
-                self.user.pk, rule_ids, source, chat_type, FilterEvent.Result.DELETED
+                self.user.pk,
+                rule_ids,
+                direction,
+                source,
+                chat_type,
+                result,
             )
+            await _record_account_update(int(self.account["id"]), direction, result)
+
+    async def _delete_matched_message(
+        self, event: Any, direction: str, chat_type: str
+    ) -> str:
+        if direction == FilterEvent.Direction.OUTGOING:
+            await self._delete_with_retry(event, revoke=True)
+            return FilterEvent.Result.DELETED_ALL
+        if chat_type not in {"channel", "supergroup"}:
+            await self._delete_with_retry(event, revoke=False)
+            return FilterEvent.Result.DELETED_SELF
+        if not self.client:
+            raise RuntimeError("client_unavailable")
+        permissions = await self.client.get_permissions(event.chat_id, "me")
+        if not (
+            bool(getattr(permissions, "is_creator", False))
+            or bool(getattr(permissions, "delete_messages", False))
+        ):
+            raise PermissionError("insufficient_delete_rights")
+        await self._delete_with_retry(event, revoke=True)
+        return FilterEvent.Result.DELETED_ALL
+
+    async def _notify_filter_warning(self, rule_ids: list[int]) -> None:
+        if not self.client:
+            return
+        ids = ", ".join(f"#{rule_id}" for rule_id in rule_ids)
+        await self.client.send_message(
+            "me", f"{FILTER_WARNING_PREFIX} {ids}: обнаружено совпадение."
+        )
 
     async def _handle_attach_menu_update(self, _update: Any) -> None:
         await self._maybe_reconcile_mini_apps(force=True)
@@ -639,10 +733,10 @@ class AccountRunner:
                 bot_username=target.username,
             )
 
-    async def _delete_with_retry(self, event: Any) -> None:
+    async def _delete_with_retry(self, event: Any, *, revoke: bool = True) -> None:
         for attempt in range(3):
             try:
-                await event.delete(revoke=True)
+                await event.delete(revoke=revoke)
                 return
             except FloodWaitError as exc:
                 if exc.seconds > 5 or attempt == 2:
@@ -673,13 +767,47 @@ def _pending_auth_flows() -> list[int]:
 
 
 @sync_to_async
+def _auth_flow_states(flow_ids: list[int]) -> dict[int, str]:
+    return dict(
+        TelegramAuthFlow.objects.filter(pk__in=flow_ids).values_list("id", "state")
+    )
+
+
+@sync_to_async
+def _expire_orphaned_auth_flows(active_flow_ids: list[int]) -> None:
+    query = TelegramAuthFlow.objects.filter(
+        state__in=[
+            TelegramAuthFlow.State.QR_READY,
+            TelegramAuthFlow.State.CODE_REQUIRED,
+            TelegramAuthFlow.State.PASSWORD_REQUIRED,
+            TelegramAuthFlow.State.VERIFYING,
+        ]
+    )
+    if active_flow_ids:
+        query = query.exclude(pk__in=active_flow_ids)
+    query.update(
+        state=TelegramAuthFlow.State.EXPIRED,
+        encrypted_payload="",
+        error_code="worker_restarted",
+        updated_at=timezone.now(),
+    )
+
+
+@sync_to_async
 def _get_flow(flow_id: int) -> TelegramAuthFlow:
     return TelegramAuthFlow.objects.select_related("user").get(pk=flow_id)
 
 
 @sync_to_async
 def _update_flow(flow_id: int, state: str, payload: str = "", error_code: str = "") -> None:
-    TelegramAuthFlow.objects.filter(pk=flow_id).update(
+    TelegramAuthFlow.objects.filter(pk=flow_id).exclude(
+        state__in=[
+            TelegramAuthFlow.State.COMPLETE,
+            TelegramAuthFlow.State.FAILED,
+            TelegramAuthFlow.State.EXPIRED,
+            TelegramAuthFlow.State.CANCELLED,
+        ]
+    ).update(
         state=state,
         encrypted_payload=payload,
         error_code=error_code[:64],
@@ -690,6 +818,13 @@ def _update_flow(flow_id: int, state: str, payload: str = "", error_code: str = 
 @sync_to_async
 def _consume_secret(flow_id: int) -> str:
     flow = TelegramAuthFlow.objects.select_related("user").get(pk=flow_id)
+    if flow.state in {
+        TelegramAuthFlow.State.COMPLETE,
+        TelegramAuthFlow.State.FAILED,
+        TelegramAuthFlow.State.EXPIRED,
+        TelegramAuthFlow.State.CANCELLED,
+    }:
+        raise AuthFlowCancelled
     if not flow.encrypted_payload:
         return ""
     secret = decrypt_for_user(flow.user, flow.encrypted_payload)
@@ -699,8 +834,27 @@ def _consume_secret(flow_id: int) -> str:
 
 
 @sync_to_async
+def _assert_flow_active(flow_id: int) -> None:
+    state = TelegramAuthFlow.objects.values_list("state", flat=True).get(pk=flow_id)
+    if state in {
+        TelegramAuthFlow.State.COMPLETE,
+        TelegramAuthFlow.State.FAILED,
+        TelegramAuthFlow.State.EXPIRED,
+        TelegramAuthFlow.State.CANCELLED,
+    }:
+        raise AuthFlowCancelled
+
+
+@sync_to_async
 def _save_authorized_account(flow_id: int, client: TelegramClient, me: Any) -> None:
     flow = TelegramAuthFlow.objects.select_related("user").get(pk=flow_id)
+    if flow.state in {
+        TelegramAuthFlow.State.COMPLETE,
+        TelegramAuthFlow.State.FAILED,
+        TelegramAuthFlow.State.EXPIRED,
+        TelegramAuthFlow.State.CANCELLED,
+    }:
+        raise AuthFlowCancelled
     identity = json.dumps({"id": int(me.id), "username": me.username or ""})
     account, _ = TelegramAccount.objects.get_or_create(user=flow.user)
     account.encrypted_session = encrypt_for_user(flow.user, client.session.save())
@@ -743,12 +897,15 @@ async def process_auth_flow(flow_id: int) -> None:
             )
             try:
                 await qr.wait(timeout=240)
+                await _assert_flow_active(flow_id)
             except SessionPasswordNeededError:
+                await _assert_flow_active(flow_id)
                 await _update_flow(flow_id, TelegramAuthFlow.State.PASSWORD_REQUIRED)
                 password = await _wait_for_secret(flow_id, flow.expires_at)
                 await client.sign_in(password=password)
         else:
             phone = await _decrypt(flow.user, flow.encrypted_payload)
+            await _assert_flow_active(flow_id)
             sent = await client.send_code_request(phone)
             await _update_flow(flow_id, TelegramAuthFlow.State.CODE_REQUIRED)
             code = await _wait_for_secret(flow_id, flow.expires_at)
@@ -758,8 +915,11 @@ async def process_auth_flow(flow_id: int) -> None:
                 await _update_flow(flow_id, TelegramAuthFlow.State.PASSWORD_REQUIRED)
                 password = await _wait_for_secret(flow_id, flow.expires_at)
                 await client.sign_in(password=password)
+        await _assert_flow_active(flow_id)
         me = await client.get_me()
         await _save_authorized_account(flow_id, client, me)
+    except AuthFlowCancelled:
+        pass
     except TimeoutError:
         await _update_flow(flow_id, TelegramAuthFlow.State.EXPIRED)
     except IntegrityError:
@@ -809,9 +969,18 @@ class TelegramSupervisor:
                 self.runners[account_id] = (runner, asyncio.create_task(runner.run()))
 
     async def _sync_auth_flows(self) -> None:
+        states = await _auth_flow_states(list(self.auth_tasks))
         for flow_id, task in list(self.auth_tasks.items()):
-            if task.done():
+            if task.done() or states.get(flow_id) in {
+                TelegramAuthFlow.State.COMPLETE,
+                TelegramAuthFlow.State.FAILED,
+                TelegramAuthFlow.State.EXPIRED,
+                TelegramAuthFlow.State.CANCELLED,
+            }:
+                if not task.done():
+                    task.cancel()
                 self.auth_tasks.pop(flow_id, None)
+        await _expire_orphaned_auth_flows(list(self.auth_tasks))
         for flow_id in await _pending_auth_flows():
             if flow_id not in self.auth_tasks:
                 self.auth_tasks[flow_id] = asyncio.create_task(process_auth_flow(flow_id))

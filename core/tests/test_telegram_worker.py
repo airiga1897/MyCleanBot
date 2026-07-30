@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from telethon.errors import AuthKeyUnregisteredError, SessionPasswordNeededError
 
 from core.models import (
     FilterEvent,
+    ForbiddenRule,
     TelegramAccount,
     TelegramAuthFlow,
     WorkerHeartbeat,
@@ -40,6 +42,8 @@ class DummyEvent:
         chat_id: int = 100,
         private: bool = True,
         channel: bool = False,
+        group: bool = False,
+        outgoing: bool = True,
         media: bool = False,
         entities: list[Any] | None = None,
     ) -> None:
@@ -47,13 +51,21 @@ class DummyEvent:
         self.raw_text = text
         self.is_private = private
         self.is_channel = channel
-        self.message = SimpleNamespace(id=5, entities=entities or [], media=media)
+        self.is_group = group
+        self.out = outgoing
+        self.message = SimpleNamespace(
+            id=5,
+            entities=entities or [],
+            media=media,
+            out=outgoing,
+        )
         self.deleted = 0
+        self.revoke_values: list[bool] = []
         self.edited = ""
 
     async def delete(self, revoke: bool) -> None:
-        assert revoke
         self.deleted += 1
+        self.revoke_values.append(revoke)
 
     async def edit(self, text: str) -> None:
         self.edited = text
@@ -64,7 +76,9 @@ async def test_database_helpers_encrypt_and_record() -> None:
     encrypted = await worker._encrypt(user, "secret")
     assert await worker._decrypt(user, encrypted) == "secret"
     rule = await worker.sync_to_async(create_rule)(user, "phrase")
-    assert await worker._load_rules(user) == [(rule.pk, "phrase")]
+    assert await worker._load_rules(user, FilterEvent.Direction.OUTGOING) == [
+        (rule.pk, "phrase", ForbiddenRule.Mode.ENFORCE)
+    ]
 
     account = await TelegramAccount.objects.acreate(user=user, encrypted_session=encrypted)
     assert (await worker._account_snapshot())[0]["id"] == account.pk
@@ -72,6 +86,7 @@ async def test_database_helpers_encrypt_and_record() -> None:
     await worker._record_event(
         user.pk,
         [rule.pk],
+        FilterEvent.Direction.OUTGOING,
         "body",
         "private",
         FilterEvent.Result.DELETED,
@@ -110,17 +125,28 @@ async def test_message_match_deletes_and_records(monkeypatch: pytest.MonkeyPatch
     event = DummyEvent("caption SECRET", media=True, private=False)
     recorded: list[tuple[Any, ...]] = []
 
-    async def load_rules(_user: User) -> list[tuple[int, str]]:
-        return [(9, "secret")]
+    async def load_rules(_user: User, _direction: str) -> list[tuple[int, str, str]]:
+        return [(9, "secret", ForbiddenRule.Mode.ENFORCE)]
+
+    async def no_mini_apps(_event: Any, _text: str) -> bool:
+        return False
 
     async def record(*args: Any) -> None:
         recorded.append(args)
 
     monkeypatch.setattr(worker, "_load_rules", load_rules)
     monkeypatch.setattr(worker, "_record_event", record)
+    monkeypatch.setattr(runner, "_handle_mini_app_message", no_mini_apps)
     await runner._handle_message(event)
     assert event.deleted == 1
-    assert recorded[0][1:5] == ([9], "caption", "group", FilterEvent.Result.DELETED)
+    assert event.revoke_values == [True]
+    assert recorded[0][1:6] == (
+        [9],
+        FilterEvent.Direction.OUTGOING,
+        "caption",
+        "group",
+        FilterEvent.Result.DELETED_ALL,
+    )
 
 
 async def test_message_failure_is_audited(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,20 +157,121 @@ async def test_message_failure_is_audited(monkeypatch: pytest.MonkeyPatch) -> No
     event = DummyEvent("blocked", chat_id=1)
     recorded: list[tuple[Any, ...]] = []
 
-    async def load_rules(_user: User) -> list[tuple[int, str]]:
-        return [(2, "blocked")]
+    async def load_rules(_user: User, _direction: str) -> list[tuple[int, str, str]]:
+        return [(2, "blocked", ForbiddenRule.Mode.ENFORCE)]
 
-    async def fail(_event: Any) -> None:
+    async def fail(_event: Any, _direction: str, _chat_type: str) -> str:
         raise RuntimeError("without-sensitive-data")
+
+    async def record(*args: Any) -> None:
+        recorded.append(args)
+
+    async def no_mini_apps(_event: Any, _text: str) -> bool:
+        return False
+
+    monkeypatch.setattr(worker, "_load_rules", load_rules)
+    monkeypatch.setattr(worker, "_record_event", record)
+    monkeypatch.setattr(runner, "_delete_matched_message", fail)
+    monkeypatch.setattr(runner, "_handle_mini_app_message", no_mini_apps)
+    await runner._handle_message(event)
+    assert recorded[0][5:] == (FilterEvent.Result.FAILED, "RuntimeError")
+
+
+async def test_incoming_private_message_is_deleted_only_for_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await User.objects.acreate_user("incoming-user", password="long-password-123")
+    runner = worker.AccountRunner({"id": 1, "user_id": user.pk, "encrypted_session": "unused"})
+    runner.user = user
+    event = DummyEvent("blocked", outgoing=False)
+    recorded: list[tuple[Any, ...]] = []
+
+    async def load_rules(_user: User, direction: str) -> list[tuple[int, str, str]]:
+        assert direction == FilterEvent.Direction.INCOMING
+        return [(4, "blocked", ForbiddenRule.Mode.ENFORCE)]
 
     async def record(*args: Any) -> None:
         recorded.append(args)
 
     monkeypatch.setattr(worker, "_load_rules", load_rules)
     monkeypatch.setattr(worker, "_record_event", record)
-    monkeypatch.setattr(runner, "_delete_with_retry", fail)
     await runner._handle_message(event)
-    assert recorded[0][4:] == (FilterEvent.Result.FAILED, "RuntimeError")
+    assert event.revoke_values == [False]
+    assert recorded[0][5] == FilterEvent.Result.DELETED_SELF
+
+
+async def test_incoming_supergroup_requires_global_delete_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await User.objects.acreate_user("group-user", password="long-password-123")
+    runner = worker.AccountRunner({"id": 1, "user_id": user.pk, "encrypted_session": "unused"})
+    runner.user = user
+    event = DummyEvent(
+        "blocked",
+        private=False,
+        channel=True,
+        group=True,
+        outgoing=False,
+    )
+    runner.client = SimpleNamespace(
+        get_permissions=lambda *_args: None,
+    )
+
+    async def permissions(*_args: Any) -> Any:
+        return SimpleNamespace(is_creator=False, delete_messages=False)
+
+    runner.client.get_permissions = permissions
+    recorded: list[tuple[Any, ...]] = []
+
+    async def load_rules(_user: User, _direction: str) -> list[tuple[int, str, str]]:
+        return [(5, "blocked", ForbiddenRule.Mode.ENFORCE)]
+
+    async def record(*args: Any) -> None:
+        recorded.append(args)
+
+    monkeypatch.setattr(worker, "_load_rules", load_rules)
+    monkeypatch.setattr(worker, "_record_event", record)
+    await runner._handle_message(event)
+    assert event.deleted == 0
+    assert recorded[0][5:] == (FilterEvent.Result.FAILED, "PermissionError")
+
+
+async def test_observe_and_warn_modes_do_not_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await User.objects.acreate_user("mode-user", password="long-password-123")
+    runner = worker.AccountRunner({"id": 1, "user_id": user.pk, "encrypted_session": "unused"})
+    runner.user = user
+    recorded: list[tuple[Any, ...]] = []
+    warnings: list[list[int]] = []
+
+    async def record(*args: Any) -> None:
+        recorded.append(args)
+
+    async def warn(rule_ids: list[int]) -> None:
+        warnings.append(rule_ids)
+
+    monkeypatch.setattr(worker, "_record_event", record)
+    monkeypatch.setattr(runner, "_notify_filter_warning", warn)
+
+    async def observe(_user: User, _direction: str) -> list[tuple[int, str, str]]:
+        return [(6, "blocked", ForbiddenRule.Mode.OBSERVE)]
+
+    monkeypatch.setattr(worker, "_load_rules", observe)
+    observed = DummyEvent("blocked", outgoing=False)
+    await runner._handle_message(observed)
+    assert observed.deleted == 0
+    assert recorded[-1][5] == FilterEvent.Result.DETECTED
+
+    async def warning(_user: User, _direction: str) -> list[tuple[int, str, str]]:
+        return [(7, "blocked", ForbiddenRule.Mode.WARN)]
+
+    monkeypatch.setattr(worker, "_load_rules", warning)
+    warned = DummyEvent("blocked", outgoing=False)
+    await runner._handle_message(warned)
+    assert warned.deleted == 0
+    assert recorded[-1][5] == FilterEvent.Result.WARNED
+    assert warnings == [[7]]
 
 
 async def test_status_command_is_ephemeral_and_other_messages_are_ignored(
@@ -155,7 +282,7 @@ async def test_status_command_is_ephemeral_and_other_messages_are_ignored(
     runner.user = user
     runner.own_id = 100
 
-    async def no_rules(_user: User) -> list[tuple[int, str]]:
+    async def no_rules(_user: User, _direction: str) -> list[tuple[int, str, str]]:
         return []
 
     async def instant_sleep(_seconds: float) -> None:
@@ -410,3 +537,38 @@ async def test_supervisor_syncs_accounts_and_auth_tasks(monkeypatch: pytest.Monk
     assert 8 in supervisor.auth_tasks
     await supervisor.auth_tasks[8]
     await supervisor._sync_auth_flows()
+
+
+async def test_supervisor_stops_cancelled_auth_and_expires_orphans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await User.objects.acreate_user("cancel-user", password="long-password-123")
+    orphan = await TelegramAuthFlow.objects.acreate(
+        user=user,
+        kind=TelegramAuthFlow.Kind.QR,
+        state=TelegramAuthFlow.State.VERIFYING,
+        encrypted_payload=await worker._encrypt(user, "transient-secret"),
+        expires_at=timezone.now() + timezone.timedelta(minutes=5),
+    )
+    cancelled = await TelegramAuthFlow.objects.acreate(
+        user=user,
+        kind=TelegramAuthFlow.Kind.QR,
+        state=TelegramAuthFlow.State.CANCELLED,
+        expires_at=timezone.now() + timezone.timedelta(minutes=5),
+    )
+    supervisor = worker.TelegramSupervisor()
+    task = asyncio.create_task(asyncio.sleep(60))
+    supervisor.auth_tasks[cancelled.pk] = task  # type: ignore[assignment]
+
+    async def no_pending() -> list[int]:
+        return []
+
+    monkeypatch.setattr(worker, "_pending_auth_flows", no_pending)
+    await supervisor._sync_auth_flows()
+    await asyncio.sleep(0)
+    await orphan.arefresh_from_db()
+
+    assert task.cancelled()
+    assert cancelled.pk not in supervisor.auth_tasks
+    assert orphan.state == TelegramAuthFlow.State.EXPIRED
+    assert orphan.encrypted_payload == ""

@@ -10,7 +10,12 @@
   {% if invite_url %}
     <label for="invite-url">Ссылка</label>
     <input id="invite-url" value="{{ invite_url }}" readonly>
+    <button class="secondary js-copy-invite" type="button" data-target="invite-url">
+      Копировать ссылку
+    </button>
+    <span class="copy-result" aria-live="polite"></span>
+    <p class="warning">Ссылка показывается только сейчас. Передайте её пользователю защищённым способом.</p>
   {% endif %}
+  <p><a href="{% url 'operator_dashboard' %}">Вернуться в кабинет оператора</a></p>
 </section>
 {% endblock %}
-

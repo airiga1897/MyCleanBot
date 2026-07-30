@@ -18,11 +18,30 @@ header {
   background: #17202a;
 }
 
-header a {
+.site-header nav,
+.actions {
+  display: flex;
+  gap: .65rem;
+  align-items: center;
+}
+
+.site-header nav a {
+  color: #dbe9f3;
+  text-decoration: none;
+}
+
+.site-header .brand {
+  margin-right: 1rem;
+}
+
+.username {
+  margin-left: auto;
+}
+
+.brand {
   color: #5cc8ff;
   font-weight: 700;
   text-decoration: none;
-  margin-right: auto;
 }
 
 main {
@@ -48,6 +67,11 @@ main {
   align-items: center;
 }
 
+.wrap {
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
 button,
 .button {
   display: inline-block;
@@ -64,6 +88,57 @@ button,
 .danger { background: #b63b4b; }
 .warning { color: #ffc85b; }
 .notice { padding: .8rem; border-left: 4px solid #3dbb79; background: #192820; }
+.muted, .meta { color: #aebdca; }
+.meta { font-size: .9rem; margin-top: .35rem; }
+.masked { display: block; margin-top: .35rem; overflow-wrap: anywhere; }
+.badge { border-radius: 999px; padding: .35rem .65rem; background: #2b3947; }
+.progress::before { content: "⏳ "; }
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.stats div {
+  border: 1px solid #2b3947;
+  border-radius: 8px;
+  padding: .8rem;
+}
+
+.stats strong,
+.stats span {
+  display: block;
+}
+
+.stats strong { font-size: 1.5rem; }
+
+.rule-list {
+  display: grid;
+  gap: .75rem;
+}
+
+.rule-item,
+.request-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-top: 1px solid #2b3947;
+  padding: 1rem 0;
+}
+
+.compact-form {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) auto;
+  gap: .5rem;
+  margin-top: .5rem;
+}
+
+.test-result { grid-column: 1 / -1; }
+.pagination { display: flex; justify-content: center; gap: 1rem; padding-top: 1rem; }
+.table-scroll { overflow-x: auto; }
+.auth-actions { margin-top: 1rem; }
 
 input,
 textarea,
@@ -96,4 +171,22 @@ td {
 .qr {
   width: 280px;
   max-width: 100%;
+}
+
+@media (max-width: 720px) {
+  .site-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .site-header nav {
+    order: 3;
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .username { margin-left: 0; }
+  .stats { grid-template-columns: 1fr; }
+  .rule-item, .request-row { flex-direction: column; }
+  .compact-form { grid-template-columns: 1fr; }
 }

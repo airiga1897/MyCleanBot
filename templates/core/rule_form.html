@@ -2,7 +2,7 @@
 {% block content %}
 <section class="card narrow">
   <h1>Новое правило</h1>
-  <p class="warning">Правило включится сразу. Для удаления потребуется подтверждение администратора.</p>
+  <p class="warning">Правило включится сразу. Защищённое правило сможет удалить только оператор.</p>
   <form method="post">
     {% csrf_token %}
     {{ form.as_p }}
@@ -10,4 +10,3 @@
   </form>
 </section>
 {% endblock %}
-

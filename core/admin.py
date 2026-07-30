@@ -18,16 +18,44 @@ from core.models import (
     WorkerHeartbeat,
 )
 
+admin.site.site_header = "Администрирование MyCleanBot"
+admin.site.site_title = "MyCleanBot"
+admin.site.index_title = "Техническое администрирование"
+
+for model, singular, plural in (
+    (Invitation, "приглашение", "приглашения"),
+    (TelegramAccount, "аккаунт Telegram", "аккаунты Telegram"),
+    (ForbiddenRule, "правило текста", "правила текста"),
+    (RuleRemovalRequest, "запрос удаления правила", "запросы удаления правил"),
+    (DisconnectRequest, "запрос отключения", "запросы отключения"),
+    (FilterEvent, "событие фильтра", "события фильтра"),
+    (MiniAppPolicy, "политика Mini Apps", "политики Mini Apps"),
+    (MiniAppRule, "правило Mini Apps", "правила Mini Apps"),
+    (MiniAppAuditEvent, "событие Mini Apps", "события Mini Apps"),
+    (WorkerHeartbeat, "служебный сигнал worker", "служебные сигналы worker"),
+    (TelegramAuthFlow, "подключение Telegram", "подключения Telegram"),
+):
+    model._meta.verbose_name = singular
+    model._meta.verbose_name_plural = plural
+
 
 @admin.register(Invitation)
 class InvitationAdmin(admin.ModelAdmin):
-    list_display = ("id", "created_by", "created_at", "expires_at", "consumed_at")
+    list_display = (
+        "id",
+        "created_by",
+        "created_at",
+        "expires_at",
+        "consumed_at",
+        "revoked_at",
+    )
     readonly_fields = (
         "token_hash",
         "created_by",
         "created_at",
         "expires_at",
         "consumed_at",
+        "revoked_at",
         "consumed_by",
     )
 
@@ -43,6 +71,9 @@ class TelegramAccountAdmin(admin.ModelAdmin):
         "status",
         "desired_enabled",
         "last_heartbeat_at",
+        "last_update_at",
+        "last_update_direction",
+        "last_update_result",
         "last_error_code",
         "updated_at",
     )
@@ -58,8 +89,15 @@ class TelegramAccountAdmin(admin.ModelAdmin):
 
 @admin.register(ForbiddenRule)
 class ForbiddenRuleAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "active", "created_at")
-    readonly_fields = ("user", "active", "created_at")
+    list_display = ("id", "user", "direction", "mode", "is_locked", "active", "created_at")
+    readonly_fields = (
+        "user",
+        "direction",
+        "mode",
+        "is_locked",
+        "active",
+        "created_at",
+    )
     exclude = ("encrypted_phrase", "phrase_fingerprint")
 
     def has_add_permission(self, request: object) -> bool:
@@ -144,10 +182,19 @@ class DisconnectRequestAdmin(admin.ModelAdmin):
 
 @admin.register(FilterEvent)
 class FilterEventAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "source", "chat_type", "result", "created_at")
+    list_display = (
+        "id",
+        "user",
+        "direction",
+        "source",
+        "chat_type",
+        "result",
+        "created_at",
+    )
     readonly_fields = (
         "user",
         "rule_ids",
+        "direction",
         "source",
         "chat_type",
         "result",

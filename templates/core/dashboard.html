@@ -2,72 +2,121 @@
 {% block content %}
 <h1>Личный кабинет</h1>
 
-<section class="card">
-  <h2>Telegram</h2>
-  <p>Статус: <strong>{{ account.get_status_display }}</strong></p>
-  {% if account.last_heartbeat_at %}<p>Последний сигнал: {{ account.last_heartbeat_at }}</p>{% endif %}
-  <form method="get" action="{% url 'dashboard' %}">
-    <button type="submit">Проверить статус</button>
-  </form>
-  {% if not account.encrypted_session %}
-    <a class="button" href="{% url 'telegram_auth' %}">Подключить Telegram</a>
-  {% elif not pending_disconnect %}
-    <form method="post" action="{% url 'request_disconnect' %}">
-      {% csrf_token %}
-      <button class="danger" type="submit">Запросить отключение</button>
-    </form>
-  {% else %}
-    <p>Запрос на отключение ожидает администратора.</p>
-  {% endif %}
-</section>
-
-<section class="card">
-  <div class="row">
+<section class="card" data-dashboard-status-url="{% url 'dashboard_status' %}">
+  <div class="row wrap">
     <div>
-      <h2>Telegram Mini Apps</h2>
-      <p>Персональные allow/deny-правила, режимы наблюдения и ограничения.</p>
+      <h2>Telegram</h2>
+      <p>Статус: <strong id="account-status">{{ account.get_status_display }}</strong></p>
+      <p class="muted">Служебный сигнал: <span id="account-heartbeat">{{ account.last_heartbeat_at|default:"пока нет" }}</span></p>
+      <p class="muted">Последнее обновление Telegram: <span id="account-update">{{ account.last_update_at|default:"пока нет" }}</span></p>
     </div>
-    <a class="button" href="{% url 'mini_app_settings' %}">Управлять</a>
+    <div class="actions">
+      {% if not account.encrypted_session %}
+        <a class="button" href="{% url 'telegram_auth' %}">Подключить Telegram</a>
+      {% elif not pending_disconnect %}
+        <form method="post" action="{% url 'request_disconnect' %}">
+          {% csrf_token %}
+          <button class="danger" type="submit">Запросить отключение</button>
+        </form>
+      {% else %}
+        <span class="badge warning">Отключение ожидает оператора</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="stats">
+    <div><strong id="stat-total">{{ event_stats.total }}</strong><span>срабатываний за 24 часа</span></div>
+    <div><strong id="stat-successful">{{ event_stats.successful }}</strong><span>успешных удалений</span></div>
+    <div><strong id="stat-failed">{{ event_stats.failed }}</strong><span>ошибок удаления</span></div>
   </div>
 </section>
 
 <section class="card">
-  <div class="row"><h2>Запрещённые фразы</h2><a class="button" href="{% url 'add_rule' %}">Добавить</a></div>
-  {% if rules %}
-    <table>
-      <thead><tr><th>Фраза</th><th>Создано</th><th>Действие</th></tr></thead>
-      <tbody>
-      {% for rule, phrase in rules %}
-        <tr>
-          <td>{{ phrase }}</td>
-          <td>{{ rule.created_at }}</td>
-          <td>
-            <form method="post" action="{% url 'request_rule_removal' rule.id %}">
-              {% csrf_token %}
-              <button type="submit">Запросить удаление</button>
-            </form>
-          </td>
-        </tr>
+  <div class="row wrap">
+    <div>
+      <h2>Telegram Mini Apps</h2>
+      <p class="muted">Персональные разрешающие и запрещающие правила.</p>
+    </div>
+    <a class="button secondary" href="{% url 'mini_app_settings' %}">Управлять</a>
+  </div>
+</section>
+
+<section class="card">
+  <div class="row wrap">
+    <div>
+      <h2>Правила текста</h2>
+      <p class="muted">Активно: {{ rules_page.paginator.count }}</p>
+    </div>
+    <a class="button" href="{% url 'add_rule' %}">Добавить правило</a>
+  </div>
+  {% if rules_page %}
+    <div class="rule-list">
+      {% for rule in rules_page %}
+        <article class="rule-item">
+          <div>
+            <strong>Правило #{{ rule.id }}</strong>
+            <span class="masked" id="rule-phrase-{{ rule.id }}">••••••••</span>
+            <div class="meta">
+              {{ rule.get_direction_display }} · {{ rule.get_mode_display }} ·
+              {% if rule.is_locked %}защищено{% else %}обычное{% endif %} ·
+              {{ rule.created_at }}
+            </div>
+          </div>
+          <div class="actions wrap">
+            <button class="secondary js-reveal-rule" type="button"
+                    data-url="{% url 'reveal_rule' rule.id %}"
+                    data-target="rule-phrase-{{ rule.id }}">Показать</button>
+            <details>
+              <summary>Проверить</summary>
+              <form class="js-test-rule compact-form" method="post"
+                    action="{% url 'test_rule' rule.id %}">
+                {% csrf_token %}
+                <input name="text" maxlength="2000" placeholder="Тестовый текст" required>
+                <button type="submit">Проверить</button>
+                <span class="test-result" aria-live="polite"></span>
+              </form>
+            </details>
+            {% if rule.id in pending_rule_ids %}
+              <span class="badge warning">Удаление ожидает оператора</span>
+            {% else %}
+              <form method="post" action="{% url 'request_rule_removal' rule.id %}">
+                {% csrf_token %}
+                <button class="danger" type="submit">
+                  {% if rule.is_locked %}Запросить удаление{% else %}Удалить{% endif %}
+                </button>
+              </form>
+            {% endif %}
+          </div>
+        </article>
       {% endfor %}
-      </tbody>
-    </table>
+    </div>
+    {% if rules_page.has_other_pages %}
+      <nav class="pagination" aria-label="Страницы правил">
+        {% if rules_page.has_previous %}<a href="?page={{ rules_page.previous_page_number }}">Назад</a>{% endif %}
+        <span>{{ rules_page.number }} из {{ rules_page.paginator.num_pages }}</span>
+        {% if rules_page.has_next %}<a href="?page={{ rules_page.next_page_number }}">Далее</a>{% endif %}
+      </nav>
+    {% endif %}
   {% else %}<p>Правил пока нет.</p>{% endif %}
 </section>
 
 <section class="card">
   <h2>Последние события</h2>
-  <table>
-    <thead><tr><th>Время</th><th>Источник</th><th>Чат</th><th>Результат</th></tr></thead>
-    <tbody>
-      {% for event in events %}
-      <tr>
-        <td>{{ event.created_at }}</td>
-        <td>{{ event.source }}</td>
-        <td>{{ event.chat_type }}</td>
-        <td>{{ event.get_result_display }}</td>
-      </tr>
-      {% empty %}<tr><td colspan="4">Событий пока нет.</td></tr>{% endfor %}
-    </tbody>
-  </table>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Время</th><th>Правило</th><th>Направление</th><th>Источник</th><th>Чат</th><th>Результат</th></tr></thead>
+      <tbody id="event-table-body">
+        {% for event in events %}
+        <tr>
+          <td>{{ event.created_at }}</td>
+          <td>{{ event.rule_ids|join:", " }}</td>
+          <td>{{ event.get_direction_display }}</td>
+          <td>{{ event.get_source_display }}</td>
+          <td>{{ event.get_chat_type_display }}</td>
+          <td>{{ event.get_result_display }}</td>
+        </tr>
+        {% empty %}<tr><td colspan="6">Событий пока нет.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 {% endblock %}
