@@ -4,6 +4,8 @@ import hashlib
 import pytest
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from core.models import (
@@ -53,6 +55,30 @@ def test_rule_is_encrypted_and_normalized_for_matching() -> None:
     assert specs[0].id == rule.pk
     assert specs[0].phrases == ("моя", "фраза")
     assert specs[0].mode == ForbiddenRule.Mode.ENFORCE
+
+
+def test_composite_rule_creation_batches_key_access_and_pattern_inserts() -> None:
+    user = User.objects.create_user("batch-owner", password="long-test-password")
+    encrypt_for_user(user, "initialize-key")
+    phrases = [f"phrase {index}" for index in range(50)]
+
+    with CaptureQueriesContext(connection) as queries:
+        rule = create_rule(user, phrases)
+
+    assert rule.patterns.count() == 50
+    assert len(queries) <= 15
+
+
+def test_rule_loading_batches_decryption_key_access() -> None:
+    user = User.objects.create_user("batch-reader", password="long-test-password")
+    for index in range(4):
+        create_rule(user, [f"rule {index} phrase {item}" for item in range(5)])
+
+    with CaptureQueriesContext(connection) as queries:
+        specs = decrypted_rules(user)
+
+    assert len(specs) == 4
+    assert len(queries) <= 8
 
 
 def test_duplicate_rule_is_rejected_after_normalization() -> None:

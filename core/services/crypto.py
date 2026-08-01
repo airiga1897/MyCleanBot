@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+from collections.abc import Iterable
 
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
@@ -55,11 +56,33 @@ def encrypt_for_user(user: User, value: str) -> str:
     return user_fernet(user).encrypt(value.encode()).decode()
 
 
+def encrypt_many_for_user(user: User, values: Iterable[str]) -> list[str]:
+    values = list(values)
+    if not values:
+        return []
+    cipher = user_fernet(user)
+    return [cipher.encrypt(value.encode()).decode() for value in values]
+
+
 def decrypt_for_user(user: User, value: str) -> str:
     try:
         return user_fernet(user).decrypt(value.encode()).decode()
     except InvalidToken as exc:
         raise DecryptionError("Unable to decrypt user data") from exc
+
+
+def decrypt_many_for_user(user: User, values: Iterable[str]) -> list[str]:
+    values = list(values)
+    if not values:
+        return []
+    cipher = user_fernet(user)
+    decrypted: list[str] = []
+    try:
+        for value in values:
+            decrypted.append(cipher.decrypt(value.encode()).decode())
+    except InvalidToken as exc:
+        raise DecryptionError("Unable to decrypt user data") from exc
+    return decrypted
 
 
 def fingerprint(value: str) -> str:

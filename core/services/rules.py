@@ -20,7 +20,13 @@ from core.models import (
     TelegramAccount,
     TelegramDialog,
 )
-from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
+from core.services.crypto import (
+    decrypt_for_user,
+    decrypt_many_for_user,
+    encrypt_for_user,
+    encrypt_many_for_user,
+    fingerprint,
+)
 from core.services.matcher import normalize_text
 
 
@@ -72,10 +78,13 @@ def _is_weakening(
     is_locked: bool,
     dialog_ids: set[int],
 ) -> tuple[bool, dict[str, int | bool]]:
+    encrypted_phrases = [item.encrypted_phrase for item in rule.patterns.all()]
     current_phrases = {
-        normalize_text(decrypt_for_user(rule.user, item.encrypted_phrase))
-        for item in rule.patterns.all()
-    } or {normalize_text(decrypt_for_user(rule.user, rule.encrypted_phrase))}
+        normalize_text(value)
+        for value in decrypt_many_for_user(
+            rule.user, encrypted_phrases or [rule.encrypted_phrase]
+        )
+    }
     current_dialog_ids = set(rule.dialog_scopes.values_list("dialog_id", flat=True))
     mode_rank: dict[str, int] = {
         ForbiddenRule.Mode.OBSERVE: 0,
@@ -159,7 +168,10 @@ def _sync_legacy_mini_app_rule(
     legacy.list_type = MiniAppRule.ListType.DENY
     legacy.match_type = MiniAppRule.MatchType.KEYWORD
     legacy.bot_id = None
-    legacy.encrypted_pattern = encrypt_for_user(rule.user, normalized[0][1])
+    encrypted_patterns = encrypt_many_for_user(
+        rule.user, [raw for _value, raw in normalized]
+    )
+    legacy.encrypted_pattern = encrypted_patterns[0]
     legacy.pattern_fingerprint = fingerprint(
         f"miniapp-unified:{legacy.account_id}:{rule.pk}"
     )
@@ -170,12 +182,14 @@ def _sync_legacy_mini_app_rule(
         [
             MiniAppRulePattern(
                 rule=legacy,
-                encrypted_pattern=encrypt_for_user(rule.user, raw),
+                encrypted_pattern=encrypted_pattern,
                 pattern_fingerprint=fingerprint(
                     f"miniapp-unified-pattern:{legacy.pk}:{value}"
                 ),
             )
-            for value, raw in normalized
+            for (value, _raw), encrypted_pattern in zip(
+                normalized, encrypted_patterns, strict=True
+            )
         ]
     )
 
@@ -199,8 +213,12 @@ def _apply_payload(rule: ForbiddenRule, data: dict[str, object]) -> ForbiddenRul
             "Первая фраза уже используется другим правилом этого пользователя"
         )
     label = str(data.get("label") or "").strip()
-    rule.encrypted_label = encrypt_for_user(rule.user, label) if label else ""
-    rule.encrypted_phrase = encrypt_for_user(rule.user, first_raw)
+    raw_values = ([label] if label else []) + [first_raw] + [
+        raw for _normalized_phrase, raw in normalized
+    ]
+    encrypted_values = iter(encrypt_many_for_user(rule.user, raw_values))
+    rule.encrypted_label = next(encrypted_values) if label else ""
+    rule.encrypted_phrase = next(encrypted_values)
     rule.phrase_fingerprint = next_fingerprint
     rule.direction = str(data["direction"])
     rule.mode = ForbiddenRule.Mode.ENFORCE
@@ -213,12 +231,14 @@ def _apply_payload(rule: ForbiddenRule, data: dict[str, object]) -> ForbiddenRul
         [
             RulePattern(
                 rule=rule,
-                encrypted_phrase=encrypt_for_user(rule.user, raw),
+                encrypted_phrase=encrypted_phrase,
                 phrase_fingerprint=fingerprint(
                     f"{rule.user_id}:{rule.pk}:{normalized_phrase}"
                 ),
             )
-            for normalized_phrase, raw in normalized
+            for (normalized_phrase, _raw), encrypted_phrase in zip(
+                normalized, encrypted_values, strict=True
+            )
         ]
     )
     _sync_legacy_mini_app_rule(rule, normalized)
@@ -252,12 +272,19 @@ def create_rule(
 ) -> ForbiddenRule:
     normalized = _normalize_phrases(phrases)
     first_normalized, first_raw = normalized[0]
+    clean_label = label.strip()
+    raw_values = ([clean_label] if clean_label else []) + [first_raw] + [
+        raw for _value, raw in normalized
+    ]
+    encrypted_values = iter(encrypt_many_for_user(user, raw_values))
+    encrypted_label = next(encrypted_values) if clean_label else ""
+    encrypted_first = next(encrypted_values)
     try:
         rule = ForbiddenRule.objects.create(
             user=user,
-            encrypted_phrase=encrypt_for_user(user, first_raw),
+            encrypted_phrase=encrypted_first,
             phrase_fingerprint=fingerprint(f"{user.pk}:{first_normalized}"),
-            encrypted_label=encrypt_for_user(user, label.strip()) if label.strip() else "",
+            encrypted_label=encrypted_label,
             direction=direction,
             mode=ForbiddenRule.Mode.ENFORCE,
             is_locked=True,
@@ -269,10 +296,12 @@ def create_rule(
         [
             RulePattern(
                 rule=rule,
-                encrypted_phrase=encrypt_for_user(user, raw),
+                encrypted_phrase=encrypted_phrase,
                 phrase_fingerprint=fingerprint(f"{user.pk}:{rule.pk}:{value}"),
             )
-            for value, raw in normalized
+            for (value, _raw), encrypted_phrase in zip(
+                normalized, encrypted_values, strict=True
+            )
         ]
     )
     dialogs = TelegramDialog.objects.filter(
@@ -347,19 +376,32 @@ def resolve_rule_change(
 
 
 def decrypted_rules(user: User, direction: str | None = None) -> list[RuleSpec]:
-    rules = (
+    queryset = (
         user.forbidden_rules.filter(active=True)
         .prefetch_related("patterns", "dialog_scopes__dialog")
         .order_by("id")
     )
     if direction:
-        rules = rules.filter(direction__in=[direction, ForbiddenRule.Direction.BOTH])
+        queryset = queryset.filter(
+            direction__in=[direction, ForbiddenRule.Direction.BOTH]
+        )
+    rules = list(queryset)
+    encrypted_by_rule = [
+        [item.encrypted_phrase for item in rule.patterns.all()]
+        or [rule.encrypted_phrase]
+        for rule in rules
+    ]
+    decrypted_values = iter(
+        decrypt_many_for_user(
+            user,
+            [value for values in encrypted_by_rule for value in values],
+        )
+    )
     specs: list[RuleSpec] = []
-    for rule in rules:
+    for rule, encrypted_values in zip(rules, encrypted_by_rule, strict=True):
         phrases = tuple(
-            normalize_text(decrypt_for_user(user, item.encrypted_phrase))
-            for item in rule.patterns.all()
-        ) or (normalize_text(decrypt_for_user(user, rule.encrypted_phrase)),)
+            normalize_text(next(decrypted_values)) for _value in encrypted_values
+        )
         scopes = frozenset(
             item.dialog.peer_fingerprint for item in rule.dialog_scopes.all()
         )
@@ -377,13 +419,17 @@ def decrypted_rules(user: User, direction: str | None = None) -> list[RuleSpec]:
 
 def rule_form_initial(rule: ForbiddenRule) -> dict[str, object]:
     patterns = list(rule.patterns.all())
-    phrases = [
-        decrypt_for_user(rule.user, item.encrypted_phrase) for item in patterns
-    ] or [decrypt_for_user(rule.user, rule.encrypted_phrase)]
+    encrypted_phrases = [item.encrypted_phrase for item in patterns] or [
+        rule.encrypted_phrase
+    ]
+    encrypted_values = ([rule.encrypted_label] if rule.encrypted_label else []) + [
+        *encrypted_phrases
+    ]
+    decrypted_values = iter(decrypt_many_for_user(rule.user, encrypted_values))
+    label = next(decrypted_values) if rule.encrypted_label else ""
+    phrases = list(decrypted_values)
     return {
-        "label": decrypt_for_user(rule.user, rule.encrypted_label)
-        if rule.encrypted_label
-        else "",
+        "label": label,
         "phrases": "\n".join(phrases),
         "direction": rule.direction,
         "mode": rule.mode,
@@ -398,3 +444,17 @@ def rule_label(rule: ForbiddenRule) -> str:
         if rule.encrypted_label
         else f"Правило #{rule.pk}"
     )
+
+
+def rule_labels(rules: Iterable[ForbiddenRule], user: User) -> dict[int, str]:
+    rule_list = list(rules)
+    encrypted_labels = [
+        rule.encrypted_label for rule in rule_list if rule.encrypted_label
+    ]
+    decrypted_labels = iter(decrypt_many_for_user(user, encrypted_labels))
+    return {
+        rule.pk: next(decrypted_labels)
+        if rule.encrypted_label
+        else f"Правило #{rule.pk}"
+        for rule in rule_list
+    }

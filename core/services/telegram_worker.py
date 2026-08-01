@@ -30,7 +30,12 @@ from core.models import (
     TelegramDialog,
     WorkerHeartbeat,
 )
-from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
+from core.services.crypto import (
+    decrypt_for_user,
+    encrypt_for_user,
+    encrypt_many_for_user,
+    fingerprint,
+)
 from core.services.dashboard_cache import invalidate_account_dashboard
 from core.services.matcher import TextCandidate, extract_candidates, find_matches, is_status_command
 from core.services.miniapps import (
@@ -165,21 +170,36 @@ def _sync_dialog_catalog(account_id: int, entries: list[dict[str, Any]]) -> None
     account = TelegramAccount.objects.select_related("user").get(pk=account_id)
     now = timezone.now()
     seen: set[str] = set()
-    for entry in entries:
+    encrypted_labels = encrypt_many_for_user(
+        account.user, [str(entry["label"])[:256] for entry in entries]
+    )
+    dialogs: list[TelegramDialog] = []
+    for entry, encrypted_label in zip(entries, encrypted_labels, strict=True):
         dialog_key = peer_fingerprint(account_id, int(entry["peer_id"]))
         seen.add(dialog_key)
-        TelegramDialog.objects.update_or_create(
-            account=account,
-            peer_fingerprint=dialog_key,
-            defaults={
-                "encrypted_label": encrypt_for_user(
-                    account.user, str(entry["label"])[:256]
-                ),
-                "kind": str(entry["kind"]),
-                "available": True,
-                "last_seen_at": now,
-            },
+        dialogs.append(
+            TelegramDialog(
+                account=account,
+                peer_fingerprint=dialog_key,
+                encrypted_label=encrypted_label,
+                kind=str(entry["kind"]),
+                available=True,
+                last_seen_at=now,
+                updated_at=now,
+            )
         )
+    TelegramDialog.objects.bulk_create(
+        dialogs,
+        update_conflicts=True,
+        update_fields=[
+            "encrypted_label",
+            "kind",
+            "available",
+            "last_seen_at",
+            "updated_at",
+        ],
+        unique_fields=["account", "peer_fingerprint"],
+    )
     TelegramDialog.objects.filter(account=account).exclude(
         peer_fingerprint__in=seen
     ).update(available=False)
