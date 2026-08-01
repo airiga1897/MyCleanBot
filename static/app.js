@@ -91,6 +91,9 @@ if (statusRoot) {
     document.getElementById("stat-total").textContent = data.stats.total;
     document.getElementById("stat-successful").textContent = data.stats.successful;
     document.getElementById("stat-failed").textContent = data.stats.failed;
+    document.getElementById("mini-stat-total").textContent = data.mini_app_stats.total;
+    document.getElementById("mini-stat-successful").textContent = data.mini_app_stats.successful;
+    document.getElementById("mini-stat-failed").textContent = data.mini_app_stats.failed;
     Object.entries(data.rule_scans || {}).forEach(([ruleId, scan]) => {
       const root = document.getElementById(`rule-history-${ruleId}`);
       if (!root) return;
@@ -143,6 +146,25 @@ if (statusRoot) {
       ].forEach((value) => {
         row.insertCell().textContent = value;
       });
+    });
+    const miniBody = document.getElementById("mini-event-table-body");
+    miniBody.replaceChildren();
+    if (!data.mini_app_events.length) {
+      const row = miniBody.insertRow();
+      const cell = row.insertCell();
+      cell.colSpan = 5;
+      cell.textContent = "Событий пока нет.";
+      return;
+    }
+    data.mini_app_events.forEach((item) => {
+      const row = miniBody.insertRow();
+      const rule = item.rule_id
+        ? `#${item.rule_id}`
+        : (item.legacy_rule_id ? `служебное #${item.legacy_rule_id}` : "—");
+      const bot = [item.bot_id || "", item.bot_username ? `@${item.bot_username}` : ""]
+        .filter(Boolean).join(" ");
+      [formatTime(item.created_at), rule, item.event_type, bot, item.result]
+        .forEach((value) => row.insertCell().textContent = value);
     });
   };
   window.setInterval(updateDashboard, 5000);

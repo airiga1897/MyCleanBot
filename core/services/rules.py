@@ -12,6 +12,8 @@ from django.utils import timezone
 from core.models import (
     ForbiddenRule,
     HistoryScan,
+    MiniAppRule,
+    MiniAppRulePattern,
     RuleChangeRequest,
     RuleDialogScope,
     RulePattern,
@@ -148,6 +150,36 @@ def queue_history_scan(rule: ForbiddenRule) -> None:
         )
 
 
+def _sync_legacy_mini_app_rule(
+    rule: ForbiddenRule, normalized: list[tuple[str, str]]
+) -> None:
+    legacy = MiniAppRule.objects.filter(protection_rule=rule).first()
+    if legacy is None:
+        return
+    legacy.list_type = MiniAppRule.ListType.DENY
+    legacy.match_type = MiniAppRule.MatchType.KEYWORD
+    legacy.bot_id = None
+    legacy.encrypted_pattern = encrypt_for_user(rule.user, normalized[0][1])
+    legacy.pattern_fingerprint = fingerprint(
+        f"miniapp-unified:{legacy.account_id}:{rule.pk}"
+    )
+    legacy.active = True
+    legacy.save()
+    legacy.patterns.all().delete()
+    MiniAppRulePattern.objects.bulk_create(
+        [
+            MiniAppRulePattern(
+                rule=legacy,
+                encrypted_pattern=encrypt_for_user(rule.user, raw),
+                pattern_fingerprint=fingerprint(
+                    f"miniapp-unified-pattern:{legacy.pk}:{value}"
+                ),
+            )
+            for value, raw in normalized
+        ]
+    )
+
+
 @transaction.atomic
 def _apply_payload(rule: ForbiddenRule, data: dict[str, object]) -> ForbiddenRule:
     normalized = _normalize_phrases(
@@ -159,8 +191,9 @@ def _apply_payload(rule: ForbiddenRule, data: dict[str, object]) -> ForbiddenRul
     rule.encrypted_phrase = encrypt_for_user(rule.user, first_raw)
     rule.phrase_fingerprint = fingerprint(f"{rule.user_id}:{first_normalized}")
     rule.direction = str(data["direction"])
-    rule.mode = str(data["mode"])
-    rule.is_locked = bool(data["is_locked"])
+    rule.mode = ForbiddenRule.Mode.ENFORCE
+    rule.is_locked = True
+    rule.active = True
     rule.revision += 1
     rule.save()
     rule.patterns.all().delete()
@@ -176,6 +209,7 @@ def _apply_payload(rule: ForbiddenRule, data: dict[str, object]) -> ForbiddenRul
             for normalized_phrase, raw in normalized
         ]
     )
+    _sync_legacy_mini_app_rule(rule, normalized)
     dialogs = TelegramDialog.objects.filter(
         account__user=rule.user,
         id__in=[
@@ -213,8 +247,9 @@ def create_rule(
             phrase_fingerprint=fingerprint(f"{user.pk}:{first_normalized}"),
             encrypted_label=encrypt_for_user(user, label.strip()) if label.strip() else "",
             direction=direction,
-            mode=mode,
-            is_locked=is_locked,
+            mode=ForbiddenRule.Mode.ENFORCE,
+            is_locked=True,
+            active=True,
         )
     except IntegrityError as exc:
         raise DuplicateRuleError("Rule already exists") from exc
@@ -259,16 +294,16 @@ def update_rule(
         rule,
         {value for value, _raw in normalized},
         direction,
-        mode,
-        is_locked,
+        ForbiddenRule.Mode.ENFORCE,
+        True,
         dialog_set,
     )
     serialized = _serialized_payload(
         label=label,
         phrases=raw_phrases,
         direction=direction,
-        mode=mode,
-        is_locked=is_locked,
+        mode=ForbiddenRule.Mode.ENFORCE,
+        is_locked=True,
         dialog_ids=dialog_set,
     )
     if rule.is_locked and weakening:

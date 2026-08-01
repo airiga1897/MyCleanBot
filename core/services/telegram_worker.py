@@ -305,7 +305,7 @@ def _load_mini_app_state(
 @sync_to_async
 def _record_mini_app_event(
     account_id: int,
-    rule_id: int | None,
+    rule: MiniAppRuleSpec | None,
     event_type: str,
     result: str,
     *,
@@ -315,7 +315,8 @@ def _record_mini_app_event(
 ) -> None:
     MiniAppAuditEvent.objects.create(
         account_id=account_id,
-        rule_id=rule_id,
+        rule_id=rule.id if rule else None,
+        protection_rule_id=rule.protection_rule_id if rule else None,
         event_type=event_type,
         bot_id=bot_id,
         bot_username=bot_username[:64],
@@ -400,6 +401,28 @@ def _rule_specs(items: list[Any]) -> list[RuleSpec]:
                 )
             )
     return specs
+
+
+def _applicable_mini_app_rules(
+    rules: list[MiniAppRuleSpec],
+    direction: str,
+    dialog_fingerprint: str,
+    *,
+    protection_rule_id: int = 0,
+) -> list[MiniAppRuleSpec]:
+    return [
+        rule
+        for rule in rules
+        if rule.direction in {direction, ForbiddenRule.Direction.BOTH}
+        and (
+            rule.dialog_fingerprints is None
+            or dialog_fingerprint in rule.dialog_fingerprints
+        )
+        and (
+            not protection_rule_id
+            or rule.protection_rule_id == protection_rule_id
+        )
+    ]
 
 
 class AccountRunner:
@@ -582,6 +605,12 @@ class AccountRunner:
         _mini_app_policy, mini_app_rules = await _load_mini_app_state(
             int(self.account["id"])
         )
+        # Unified protection rules are evaluated by the regular history matcher
+        # below. Keep only unlinked legacy Mini App rules here to avoid duplicate
+        # matches and to preserve preview semantics.
+        mini_app_rules = [
+            rule for rule in mini_app_rules if rule.protection_rule_id is None
+        ]
         target_rule_id = int(scan.get("rule_id") or 0)
         target_revision = int(scan.get("rule_revision") or 0)
         if target_rule_id:
@@ -627,15 +656,22 @@ class AccountRunner:
                             text, list(getattr(message, "entities", None) or [])
                         )
                     )
+                    applicable_mini_app_rules = _applicable_mini_app_rules(
+                        mini_app_rules,
+                        direction,
+                        dialog_fingerprint,
+                        protection_rule_id=target_rule_id,
+                    )
                     mini_app_matched = await self._enforce_mini_app_text(
                         message,
                         mini_app_text,
-                        mini_app_rules,
+                        applicable_mini_app_rules,
                         source_entity=getattr(dialog, "entity", None),
                         is_outgoing=bool(getattr(message, "out", False)),
                     )
                     if mini_app_matched:
                         matches_found += 1
+                        text = ""
                     candidates = extract_candidates(
                         text,
                         list(getattr(message, "entities", None) or []),
@@ -1037,7 +1073,7 @@ class AccountRunner:
         except Exception as exc:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                decision.rule.id,
+                decision.rule,
                 MiniAppAuditEvent.EventType.MENU_DISABLED,
                 MiniAppAuditEvent.Result.FAILED,
                 bot_id=target.bot_id,
@@ -1047,7 +1083,7 @@ class AccountRunner:
         else:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                decision.rule.id,
+                decision.rule,
                 MiniAppAuditEvent.EventType.MENU_DISABLED,
                 MiniAppAuditEvent.Result.SUCCEEDED,
                 bot_id=target.bot_id,
@@ -1069,7 +1105,7 @@ class AccountRunner:
         except Exception as exc:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                decision.rule.id,
+                decision.rule,
                 MiniAppAuditEvent.EventType.BOT_BLOCKED,
                 MiniAppAuditEvent.Result.FAILED,
                 bot_id=target.bot_id,
@@ -1079,7 +1115,7 @@ class AccountRunner:
         else:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                decision.rule.id,
+                decision.rule,
                 MiniAppAuditEvent.EventType.BOT_BLOCKED,
                 MiniAppAuditEvent.Result.SUCCEEDED,
                 bot_id=target.bot_id,
@@ -1099,7 +1135,7 @@ class AccountRunner:
         except Exception as exc:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                decision.rule.id,
+                decision.rule,
                 MiniAppAuditEvent.EventType.DIALOG_DELETED,
                 MiniAppAuditEvent.Result.FAILED,
                 bot_id=target.bot_id,
@@ -1109,7 +1145,7 @@ class AccountRunner:
         else:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                decision.rule.id,
+                decision.rule,
                 MiniAppAuditEvent.EventType.DIALOG_DELETED,
                 MiniAppAuditEvent.Result.SUCCEEDED,
                 bot_id=target.bot_id,
@@ -1129,6 +1165,17 @@ class AccountRunner:
             _policy, rules = await _load_mini_app_state(int(self.account["id"]))
         except TelegramAccount.DoesNotExist:
             return False
+        if not rules:
+            return False
+        direction = (
+            ForbiddenRule.Direction.OUTGOING
+            if is_outgoing
+            else ForbiddenRule.Direction.INCOMING
+        )
+        chat_fingerprint = peer_fingerprint(
+            int(self.account["id"]), int(getattr(event, "chat_id", 0) or 0)
+        )
+        rules = _applicable_mini_app_rules(rules, direction, chat_fingerprint)
         if not rules:
             return False
         source_entity: Any | None = None
@@ -1203,13 +1250,19 @@ class AccountRunner:
                         chat,
                     )
                 )
-        targets.append((MiniAppTarget(), None))
         matches: list[tuple[MiniAppTarget, Any | None, MiniAppRuleDecision]] = []
         for target, entity in targets:
             decision = decide_mini_app_rule(rules, target, text)
             if not decision.denied or not decision.rule:
                 continue
             matches.append((target, entity, decision))
+        legacy_rules = [rule for rule in rules if rule.protection_rule_id is None]
+        if legacy_rules:
+            legacy_decision = decide_mini_app_rule(
+                legacy_rules, MiniAppTarget(), text
+            )
+            if legacy_decision.denied and legacy_decision.rule:
+                matches.append((MiniAppTarget(), None, legacy_decision))
         if not matches:
             return False
         if source_entity is not None and bool(getattr(source_entity, "bot", False)):
@@ -1245,7 +1298,7 @@ class AccountRunner:
         except Exception as exc:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                primary_rule.id,
+                primary_rule,
                 MiniAppAuditEvent.EventType.MESSAGE_DELETED,
                 MiniAppAuditEvent.Result.FAILED,
                 bot_id=primary_target.bot_id,
@@ -1255,7 +1308,7 @@ class AccountRunner:
         else:
             await _record_mini_app_event(
                 int(self.account["id"]),
-                primary_rule.id,
+                primary_rule,
                 MiniAppAuditEvent.EventType.MESSAGE_DELETED,
                 MiniAppAuditEvent.Result.SUCCEEDED,
                 bot_id=primary_target.bot_id,
@@ -1282,7 +1335,7 @@ class AccountRunner:
         result = MiniAppAuditEvent.Result.SUCCEEDED
         await _record_mini_app_event(
             int(self.account["id"]),
-            decision.rule.id,
+            decision.rule,
             event_type,
             result,
             bot_id=target.bot_id,

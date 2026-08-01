@@ -30,21 +30,12 @@
   </div>
 </section>
 
-<section class="card">
+<section class="card" id="protection-rules">
   <div class="row wrap">
     <div>
-      <h2>Telegram Mini Apps</h2>
-      <p class="muted">Персональные разрешающие и запрещающие правила.</p>
-    </div>
-    <a class="button secondary" href="{% url 'mini_app_settings' %}">Управлять</a>
-  </div>
-</section>
-
-<section class="card">
-  <div class="row wrap">
-    <div>
-      <h2>Правила текста</h2>
+      <h2>Правила защиты</h2>
       <p class="muted">Активно: {{ rules_page.paginator.count }}</p>
+      <p class="muted">Фразы применяются к сообщениям, ссылкам, ботам, названиям и Mini Apps. Все правила работают в режиме жёсткого ограничения и всегда защищены.</p>
     </div>
     <a class="button" href="{% url 'add_rule' %}">Добавить правило</a>
   </div>
@@ -57,8 +48,7 @@
             <strong>{{ row.label }}</strong>
             <span class="masked" id="rule-phrase-{{ rule.id }}">••••••••</span>
             <div class="meta">
-              {{ rule.get_direction_display }} · {{ rule.get_mode_display }} ·
-              {% if rule.is_locked %}защищено{% else %}обычное{% endif %} ·
+              {{ rule.get_direction_display }} · жёсткое ограничение · защищено ·
               {{ row.pattern_count }} фраз ·
               {% if row.scope_count %}{{ row.scope_count }} чатов{% else %}все чаты{% endif %} ·
               версия {{ rule.revision }}
@@ -108,9 +98,7 @@
             {% else %}
               <form method="post" action="{% url 'request_rule_removal' rule.id %}">
                 {% csrf_token %}
-                <button class="danger" type="submit">
-                  {% if rule.is_locked %}Запросить удаление{% else %}Удалить{% endif %}
-                </button>
+                <button class="danger" type="submit">Запросить удаление</button>
               </form>
             {% endif %}
           </div>
@@ -126,6 +114,16 @@
       </nav>
     {% endif %}
   {% else %}<p>Правил пока нет.</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>Статус ботов и Mini Apps</h2>
+  <p class="muted">Проверяются attachment/side menu, новые сообщения и ссылки, известные диалоги и профили ботов. Уже открытый WebView Telegram закрыть удалённо нельзя.</p>
+  <div class="stats">
+    <div><strong id="mini-stat-total">{{ mini_app_stats.total }}</strong><span>действий за 24 часа</span></div>
+    <div><strong id="mini-stat-successful">{{ mini_app_stats.successful }}</strong><span>успешных действий</span></div>
+    <div><strong id="mini-stat-failed">{{ mini_app_stats.failed }}</strong><span>ошибок действий</span></div>
+  </div>
 </section>
 
 <section class="card">
@@ -153,6 +151,27 @@
           <td>{{ event.get_result_display }}</td>
         </tr>
         {% empty %}<tr><td colspan="6">Событий пока нет.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>История действий с ботами и Mini Apps</h2>
+  <p class="muted">Текст сообщений, названия чатов, Telegram session и содержимое WebView не сохраняются.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Время</th><th>Правило</th><th>Действие</th><th>bot_id / username</th><th>Результат</th></tr></thead>
+      <tbody id="mini-event-table-body">
+        {% for event in mini_app_events %}
+        <tr>
+          <td>{{ event.created_at }}</td>
+          <td>{% if event.protection_rule_id %}#{{ event.protection_rule_id }}{% elif event.rule_id %}служебное #{{ event.rule_id }}{% else %}—{% endif %}</td>
+          <td>{{ event.get_event_type_display }}</td>
+          <td>{% if event.bot_id %}{{ event.bot_id }}{% endif %}{% if event.bot_username %} @{{ event.bot_username }}{% endif %}</td>
+          <td>{{ event.get_result_display }}</td>
+        </tr>
+        {% empty %}<tr><td colspan="5">Событий пока нет.</td></tr>{% endfor %}
       </tbody>
     </table>
   </div>

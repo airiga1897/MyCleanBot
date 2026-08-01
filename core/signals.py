@@ -2,7 +2,7 @@ from django.db.models.signals import pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 
-from core.models import ForbiddenRule, HistoryScan
+from core.models import ForbiddenRule, HistoryScan, MiniAppRule
 
 
 @receiver(pre_delete, sender=ForbiddenRule)
@@ -24,3 +24,4 @@ def cancel_rule_history_before_delete(
         completed_at=timezone.now(),
         last_error_code="rule_deleted",
     )
+    MiniAppRule.objects.filter(protection_rule=instance).update(active=False)

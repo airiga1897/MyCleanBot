@@ -40,16 +40,6 @@ class RuleForm(forms.Form):
         choices=ForbiddenRule.Direction.choices,
         initial=ForbiddenRule.Direction.BOTH,
     )
-    mode = forms.ChoiceField(
-        label="Режим",
-        choices=ForbiddenRule.Mode.choices,
-        initial=ForbiddenRule.Mode.ENFORCE,
-    )
-    is_locked = forms.BooleanField(
-        required=False,
-        initial=True,
-        label="Защитить правило: удаление потребует подтверждения оператора",
-    )
     dialogs = TelegramDialogChoiceField(
         label="Чаты и каналы",
         queryset=TelegramDialog.objects.none(),
