@@ -2,6 +2,15 @@ function csrfToken() {
   return document.querySelector('input[name="csrfmiddlewaretoken"]')?.value || "";
 }
 
+document.querySelectorAll(".js-single-submit").forEach((form) => {
+  form.addEventListener("submit", () => {
+    const button = form.querySelector('button[type="submit"]');
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = "Создаём аккаунт…";
+  });
+});
+
 document.querySelectorAll(".js-copy-invite").forEach((button) => {
   button.addEventListener("click", async () => {
     const input = document.getElementById(button.dataset.target);

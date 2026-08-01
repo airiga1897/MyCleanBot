@@ -6,7 +6,7 @@ from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
-from core.models import ForbiddenRule, MiniAppPolicy, MiniAppRule, TelegramDialog
+from core.models import ForbiddenRule, MiniAppRule, TelegramDialog
 from core.services.crypto import decrypt_for_user
 from core.services.miniapps import normalize_rule_value
 
@@ -103,48 +103,26 @@ class AuthSecretForm(forms.Form):
     )
 
 
-class MiniAppPolicyForm(forms.ModelForm):  # type: ignore[type-arg]
-    confirm_enforce = forms.BooleanField(
-        required=False,
-        label=(
-            "Я понимаю ограничения Telegram API и подтверждаю включение режима ограничения"
-        ),
+class MiniAppRuleForm(forms.Form):
+    value = forms.CharField(
+        label="Запрещённые фразы — по одной в строке",
+        max_length=2000,
+        strip=True,
+        widget=forms.Textarea(attrs={"rows": 5}),
     )
 
-    class Meta:
-        model = MiniAppPolicy
-        fields = ("mode", "block_bot", "notify_user", "notify_operator")
-        labels = {
-            "mode": "Режим",
-            "block_bot": "Блокировать связанного бота в режиме ограничения",
-            "notify_user": "Уведомлять пользователя в «Избранном»",
-            "notify_operator": "Уведомлять оператора в кабинете",
-        }
-
-    def clean(self) -> dict[str, Any]:
-        cleaned = super().clean() or {}
-        if (
-            cleaned.get("mode") == MiniAppPolicy.Mode.ENFORCE
-            and not cleaned.get("confirm_enforce")
-        ):
-            self.add_error("confirm_enforce", "Нужно отдельное явное подтверждение.")
-        if (
-            cleaned.get("mode") == MiniAppPolicy.Mode.WARN
-            and not cleaned.get("notify_user")
-            and not cleaned.get("notify_operator")
-        ):
-            self.add_error("mode", "Для режима предупреждения выберите канал уведомления.")
-        return cleaned
-
-
-class MiniAppRuleForm(forms.Form):
-    list_type = forms.ChoiceField(label="Список", choices=MiniAppRule.ListType.choices)
-    match_type = forms.ChoiceField(label="Тип совпадения", choices=MiniAppRule.MatchType.choices)
-    value = forms.CharField(label="Значение", max_length=200, strip=True)
-
     def clean_value(self) -> str:
-        value = str(self.cleaned_data["value"])
-        match_type = self.cleaned_data.get("match_type")
-        if match_type:
-            normalize_rule_value(match_type, value)
-        return value
+        values = list(
+            dict.fromkeys(
+                line.strip()
+                for line in str(self.cleaned_data["value"]).splitlines()
+                if line.strip()
+            )
+        )
+        if not values:
+            raise forms.ValidationError("Добавьте хотя бы одну фразу.")
+        if len(values) > 20:
+            raise forms.ValidationError("В одном правиле можно указать не более 20 фраз.")
+        for value in values:
+            normalize_rule_value(MiniAppRule.MatchType.KEYWORD, value)
+        return "\n".join(values)

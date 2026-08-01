@@ -141,11 +141,20 @@ MAX_TELEGRAM_ACCOUNTS = int(os.getenv("MAX_TELEGRAM_ACCOUNTS", "10"))
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "redact_invitation_tokens": {
+            "()": "core.log_filters.RedactInvitationTokenFilter",
+        },
+    },
     "formatters": {
         "jsonish": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
     },
     "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "jsonish"},
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "jsonish",
+            "filters": ["redact_invitation_tokens"],
+        },
     },
     "root": {"handlers": ["console"], "level": os.getenv("LOG_LEVEL", "INFO")},
 }

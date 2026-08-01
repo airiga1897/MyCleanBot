@@ -372,9 +372,9 @@ class MiniAppPolicy(models.Model):
     account = models.OneToOneField(
         TelegramAccount, on_delete=models.CASCADE, related_name="mini_app_policy"
     )
-    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.OBSERVE)
-    block_bot = models.BooleanField(default=False)
-    notify_user = models.BooleanField(default=True)
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.ENFORCE)
+    block_bot = models.BooleanField(default=True)
+    notify_user = models.BooleanField(default=False)
     notify_admin = models.BooleanField(default=False)
     notify_operator = models.BooleanField(default=False)
     updated_at = models.DateTimeField(auto_now=True)
@@ -419,13 +419,37 @@ class MiniAppRule(models.Model):
         return f"Mini App rule #{self.pk}"
 
 
+class MiniAppRulePattern(models.Model):
+    rule = models.ForeignKey(
+        MiniAppRule, on_delete=models.CASCADE, related_name="patterns"
+    )
+    encrypted_pattern = models.TextField()
+    pattern_fingerprint = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule", "pattern_fingerprint"],
+                name="unique_mini_app_rule_pattern",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"Mini App rule pattern #{self.pk}"
+
+
 class MiniAppAuditEvent(models.Model):
     class EventType(models.TextChoices):
         MENU_DETECTED = "menu_detected", "Mini App обнаружено в меню"
         OUTGOING_DETECTED = "outgoing_detected", "Исходящее сообщение обнаружено"
+        INCOMING_DETECTED = "incoming_detected", "Входящее сообщение обнаружено"
+        PROFILE_DETECTED = "profile_detected", "Профиль или диалог обнаружен"
         MENU_DISABLED = "menu_disabled", "Mini App отключено в меню"
         BOT_BLOCKED = "bot_blocked", "Бот заблокирован"
         MESSAGE_DELETED = "message_deleted", "Сообщение удалено"
+        DIALOG_DELETED = "dialog_deleted", "Диалог или история удалены"
         USER_WARNED = "user_warned", "Пользователь предупреждён"
         ADMIN_NOTIFIED = "admin_notified", "Администратор уведомлён"
 

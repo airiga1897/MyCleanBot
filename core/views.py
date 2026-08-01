@@ -10,7 +10,6 @@ import qrcode
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
-from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core.paginator import Paginator
@@ -26,7 +25,6 @@ from django_ratelimit.decorators import ratelimit
 from core.forms import (
     AuthSecretForm,
     InviteRegistrationForm,
-    MiniAppPolicyForm,
     MiniAppRuleForm,
     PhoneAuthForm,
     RuleForm,
@@ -243,8 +241,8 @@ def register_invite(request: HttpRequest, token: str) -> HttpResponse:
         invitation.consumed_by = user
         invitation.save(update_fields=["consumed_at", "consumed_by"])
         TelegramAccount.objects.create(user=user)
-        login(request, user)
-        return redirect("dashboard")
+        messages.success(request, "Аккаунт создан. Войдите с указанными логином и паролем.")
+        return redirect("login")
     return render(request, "core/register.html", {"form": form})
 
 
@@ -529,23 +527,26 @@ def request_disconnect(request: HttpRequest) -> HttpResponse:
 
 
 @login_required
-@require_http_methods(["GET", "POST"])
+@require_http_methods(["GET"])
 def mini_app_settings(request: HttpRequest) -> HttpResponse:
     user = _authenticated_user(request)
     account, _ = TelegramAccount.objects.get_or_create(user=user)
-    policy, _ = MiniAppPolicy.objects.get_or_create(account=account)
-    policy_form = MiniAppPolicyForm(request.POST or None, instance=policy)
-    if request.method == "POST" and policy_form.is_valid():
-        policy_form.save()
-        messages.success(request, "Политика Mini Apps обновлена.")
-        return redirect("mini_app_settings")
+    policy, _ = MiniAppPolicy.objects.update_or_create(
+        account=account,
+        defaults={
+            "mode": MiniAppPolicy.Mode.ENFORCE,
+            "block_bot": True,
+            "notify_user": False,
+            "notify_admin": False,
+            "notify_operator": False,
+        },
+    )
     return render(
         request,
         "core/mini_app_settings.html",
         {
             "account": account,
             "policy": policy,
-            "policy_form": policy_form,
             "rule_form": MiniAppRuleForm(),
             "mini_app_rules": display_mini_app_rules(account),
             "mini_app_events": account.mini_app_events.select_related("rule")[:100],
@@ -563,14 +564,24 @@ def add_mini_app_rule(request: HttpRequest) -> HttpResponse:
         try:
             create_mini_app_rule(
                 account,
-                form.cleaned_data["list_type"],
-                form.cleaned_data["match_type"],
+                MiniAppRule.ListType.DENY,
+                MiniAppRule.MatchType.KEYWORD,
                 form.cleaned_data["value"],
             )
         except DuplicateMiniAppRuleError:
             messages.error(request, "Такое правило уже существует.")
         else:
-            messages.success(request, "Правило Mini Apps добавлено.")
+            if not account.history_scans.filter(
+                status__in=[HistoryScan.Status.QUEUED, HistoryScan.Status.RUNNING]
+            ).exists():
+                HistoryScan.objects.create(
+                    account=account,
+                    phase=HistoryScan.Phase.ENFORCE,
+                )
+            messages.success(
+                request,
+                "Жёсткое правило добавлено. Фоновая очистка начнётся автоматически.",
+            )
     else:
         messages.error(request, "Правило не добавлено: проверьте тип и значение.")
     return redirect("mini_app_settings")
