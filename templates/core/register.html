@@ -3,11 +3,10 @@
 {% block content %}
 <section class="card narrow">
   <h1>Регистрация по приглашению</h1>
-  <form method="post">
+  <form method="post" class="js-single-submit">
     {% csrf_token %}
     {{ form.as_p }}
     <button type="submit">Создать аккаунт</button>
   </form>
 </section>
 {% endblock %}
-

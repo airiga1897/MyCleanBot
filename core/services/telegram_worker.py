@@ -270,7 +270,27 @@ def _load_mini_app_state(
     account_id: int,
 ) -> tuple[dict[str, Any], list[MiniAppRuleSpec]]:
     account = TelegramAccount.objects.select_related("user").get(pk=account_id)
-    policy, _ = MiniAppPolicy.objects.get_or_create(account=account)
+    policy, created = MiniAppPolicy.objects.get_or_create(
+        account=account,
+        defaults={
+            "mode": MiniAppPolicy.Mode.ENFORCE,
+            "block_bot": True,
+            "notify_user": False,
+            "notify_admin": False,
+            "notify_operator": False,
+        },
+    )
+    hard_values = {
+        "mode": MiniAppPolicy.Mode.ENFORCE,
+        "block_bot": True,
+        "notify_user": False,
+        "notify_admin": False,
+        "notify_operator": False,
+    }
+    if not created and any(getattr(policy, key) != value for key, value in hard_values.items()):
+        MiniAppPolicy.objects.filter(pk=policy.pk).update(**hard_values)
+        for key, value in hard_values.items():
+            setattr(policy, key, value)
     return (
         {
             "mode": policy.mode,
@@ -559,6 +579,9 @@ class AccountRunner:
                 await _load_rules(self.user, FilterEvent.Direction.OUTGOING)
             ),
         }
+        _mini_app_policy, mini_app_rules = await _load_mini_app_state(
+            int(self.account["id"])
+        )
         target_rule_id = int(scan.get("rule_id") or 0)
         target_revision = int(scan.get("rule_revision") or 0)
         if target_rule_id:
@@ -598,6 +621,21 @@ class AccountRunner:
                 )
                 text = str(getattr(message, "raw_text", "") or "")
                 if not text.startswith((MINI_APP_WARNING_PREFIX, FILTER_WARNING_PREFIX)):
+                    mini_app_text = "\n".join(
+                        candidate.value
+                        for candidate in extract_candidates(
+                            text, list(getattr(message, "entities", None) or [])
+                        )
+                    )
+                    mini_app_matched = await self._enforce_mini_app_text(
+                        message,
+                        mini_app_text,
+                        mini_app_rules,
+                        source_entity=getattr(dialog, "entity", None),
+                        is_outgoing=bool(getattr(message, "out", False)),
+                    )
+                    if mini_app_matched:
+                        matches_found += 1
                     candidates = extract_candidates(
                         text,
                         list(getattr(message, "entities", None) or []),
@@ -726,10 +764,11 @@ class AccountRunner:
         if direction == FilterEvent.Direction.OUTGOING and is_status_command(text, saved):
             await self._show_status(event, message_key)
             return
-        if (
-            direction == FilterEvent.Direction.OUTGOING
-            and await self._handle_mini_app_message(event, text)
-        ):
+        mini_app_text = "\n".join(
+            candidate.value
+            for candidate in extract_candidates(text, event.message.entities)
+        )
+        if await self._handle_mini_app_message(event, mini_app_text):
             return
         candidates = extract_candidates(text, event.message.entities)
         if event.message.media:
@@ -893,9 +932,91 @@ class AccountRunner:
                 MiniAppAuditEvent.EventType.MENU_DETECTED,
                 target,
             )
-            if policy["mode"] == MiniAppPolicy.Mode.ENFORCE and user is not None:
+            if user is not None:
                 await self._disable_mini_app(policy, decision, target, user)
+        await self._reconcile_forbidden_dialogs(rules)
         self.warned_mini_app_bot_ids.intersection_update(installed_ids)
+
+    async def _reconcile_forbidden_dialogs(
+        self, rules: list[MiniAppRuleSpec]
+    ) -> None:
+        if not self.client or not rules:
+            return
+        dialogs: list[Any] = [dialog async for dialog in self.client.iter_dialogs()]
+        for dialog in dialogs:
+            entity = getattr(dialog, "entity", None)
+            if entity is None or int(getattr(dialog, "id", 0)) == self.own_id:
+                continue
+            is_bot = bool(getattr(entity, "bot", False))
+            is_group_or_channel = bool(
+                getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False)
+            )
+            if not is_bot and not is_group_or_channel:
+                continue
+            username = str(getattr(entity, "username", "") or "").casefold()
+            title = str(
+                getattr(dialog, "name", "")
+                or getattr(entity, "title", "")
+                or getattr(entity, "first_name", "")
+                or ""
+            )
+            about = await self._entity_about(entity) if is_bot else ""
+            target = MiniAppTarget(
+                bot_id=int(getattr(entity, "id", 0)) or None,
+                username=username,
+                title=title,
+            )
+            decision = decide_mini_app_rule(rules, target, about)
+            if not decision.denied or not decision.rule:
+                continue
+            await self._record_mini_app_detection(
+                {}, decision, MiniAppAuditEvent.EventType.PROFILE_DETECTED, target
+            )
+            if is_bot:
+                await self._block_bot(decision, target, entity)
+            await self._delete_forbidden_dialog(decision, target, entity)
+            if is_bot and about:
+                await self._enforce_matching_profile_links(rules, about, entity)
+
+    async def _enforce_matching_profile_links(
+        self,
+        rules: list[MiniAppRuleSpec],
+        about: str,
+        source_entity: Any,
+    ) -> None:
+        if not self.client:
+            return
+        source_id = int(getattr(source_entity, "id", 0))
+        for username in sorted(extract_bot_usernames(about)):
+            try:
+                entity = await self.client.get_entity(username)
+            except Exception:
+                continue
+            if not bool(getattr(entity, "bot", False)):
+                continue
+            target = MiniAppTarget(
+                bot_id=int(getattr(entity, "id", 0)) or None,
+                username=str(getattr(entity, "username", "") or username).casefold(),
+                title=str(getattr(entity, "first_name", "") or ""),
+            )
+            if target.bot_id == source_id:
+                continue
+            decision = decide_mini_app_rule(rules, target)
+            if not decision.denied or not decision.rule:
+                continue
+            await self._record_mini_app_detection(
+                {}, decision, MiniAppAuditEvent.EventType.PROFILE_DETECTED, target
+            )
+            await self._disable_mini_app({}, decision, target, entity)
+
+    async def _entity_about(self, entity: Any) -> str:
+        if not self.client or not bool(getattr(entity, "bot", False)):
+            return ""
+        try:
+            result = await self.client(functions.users.GetFullUserRequest(id=entity))
+        except Exception:
+            return ""
+        return str(getattr(getattr(result, "full_user", None), "about", "") or "")
 
     async def _disable_mini_app(
         self,
@@ -932,8 +1053,8 @@ class AccountRunner:
                 bot_id=target.bot_id,
                 bot_username=target.username,
             )
-        if policy["block_bot"]:
-            await self._block_bot(decision, target, user)
+        await self._block_bot(decision, target, user)
+        await self._delete_forbidden_dialog(decision, target, user)
 
     async def _block_bot(
         self,
@@ -965,13 +1086,92 @@ class AccountRunner:
                 bot_username=target.username,
             )
 
-    async def _handle_mini_app_message(self, event: Any, text: str) -> bool:
+    async def _delete_forbidden_dialog(
+        self,
+        decision: MiniAppRuleDecision,
+        target: MiniAppTarget,
+        entity: Any,
+    ) -> None:
+        if not self.client or not decision.rule:
+            return
+        try:
+            await self.client.delete_dialog(entity, revoke=False)
+        except Exception as exc:
+            await _record_mini_app_event(
+                int(self.account["id"]),
+                decision.rule.id,
+                MiniAppAuditEvent.EventType.DIALOG_DELETED,
+                MiniAppAuditEvent.Result.FAILED,
+                bot_id=target.bot_id,
+                bot_username=target.username,
+                error_code=exc.__class__.__name__,
+            )
+        else:
+            await _record_mini_app_event(
+                int(self.account["id"]),
+                decision.rule.id,
+                MiniAppAuditEvent.EventType.DIALOG_DELETED,
+                MiniAppAuditEvent.Result.SUCCEEDED,
+                bot_id=target.bot_id,
+                bot_username=target.username,
+            )
+
+    async def _handle_mini_app_message(
+        self, event: Any, text: str, is_outgoing: bool | None = None
+    ) -> bool:
         if not self.client:
             return False
-        policy, rules = await _load_mini_app_state(int(self.account["id"]))
+        if is_outgoing is None:
+            is_outgoing = bool(
+                getattr(event, "out", getattr(getattr(event, "message", None), "out", False))
+            )
+        try:
+            _policy, rules = await _load_mini_app_state(int(self.account["id"]))
+        except TelegramAccount.DoesNotExist:
+            return False
         if not rules:
             return False
+        source_entity: Any | None = None
+        if not is_outgoing and bool(getattr(event, "is_private", False)):
+            try:
+                candidate = await event.get_chat()
+            except Exception:
+                candidate = None
+            if candidate is not None and bool(getattr(candidate, "bot", False)):
+                source_entity = candidate
+        return await self._enforce_mini_app_text(
+            event,
+            text,
+            rules,
+            source_entity=source_entity,
+            is_outgoing=is_outgoing,
+        )
+
+    async def _enforce_mini_app_text(
+        self,
+        message: Any,
+        text: str,
+        rules: list[MiniAppRuleSpec],
+        *,
+        source_entity: Any | None,
+        is_outgoing: bool,
+    ) -> bool:
+        if not self.client or not rules:
+            return False
         targets: list[tuple[MiniAppTarget, Any | None]] = []
+        if source_entity is not None and bool(getattr(source_entity, "bot", False)):
+            targets.append(
+                (
+                    MiniAppTarget(
+                        bot_id=int(getattr(source_entity, "id", 0)) or None,
+                        username=str(
+                            getattr(source_entity, "username", "") or ""
+                        ).casefold(),
+                        title=str(getattr(source_entity, "first_name", "") or ""),
+                    ),
+                    source_entity,
+                )
+            )
         for username in sorted(extract_bot_usernames(text)):
             entity: Any | None = None
             bot_id: int | None = None
@@ -986,11 +1186,11 @@ class AccountRunner:
         if (
             text.lstrip().startswith(_BARE_BOT_COMMAND)
             and "@" not in text.split(maxsplit=1)[0]
-            and bool(getattr(event, "is_private", False))
-            and hasattr(event, "get_chat")
+            and bool(getattr(message, "is_private", False))
+            and hasattr(message, "get_chat")
         ):
             try:
-                chat = await event.get_chat()
+                chat = await message.get_chat()
             except Exception:
                 chat = None
             if chat is not None and bool(getattr(chat, "bot", False)):
@@ -1004,61 +1204,82 @@ class AccountRunner:
                     )
                 )
         targets.append((MiniAppTarget(), None))
+        matches: list[tuple[MiniAppTarget, Any | None, MiniAppRuleDecision]] = []
         for target, entity in targets:
             decision = decide_mini_app_rule(rules, target, text)
             if not decision.denied or not decision.rule:
                 continue
+            matches.append((target, entity, decision))
+        if not matches:
+            return False
+        if source_entity is not None and bool(getattr(source_entity, "bot", False)):
+            source_id = int(getattr(source_entity, "id", 0))
+            if not any(
+                int(getattr(entity, "id", 0)) == source_id
+                for _target, entity, _decision in matches
+                if entity is not None
+            ):
+                source_target = MiniAppTarget(
+                    bot_id=source_id or None,
+                    username=str(
+                        getattr(source_entity, "username", "") or ""
+                    ).casefold(),
+                    title=str(getattr(source_entity, "first_name", "") or ""),
+                )
+                matches.insert(0, (source_target, source_entity, matches[0][2]))
+        for target, _entity, decision in matches:
             await self._record_mini_app_detection(
-                policy,
+                {},
                 decision,
-                MiniAppAuditEvent.EventType.OUTGOING_DETECTED,
+                MiniAppAuditEvent.EventType.OUTGOING_DETECTED
+                if is_outgoing
+                else MiniAppAuditEvent.EventType.INCOMING_DETECTED,
                 target,
             )
-            if policy["mode"] != MiniAppPolicy.Mode.ENFORCE:
-                return False
-            try:
-                await self._delete_with_retry(event)
-            except Exception as exc:
-                await _record_mini_app_event(
-                    int(self.account["id"]),
-                    decision.rule.id,
-                    MiniAppAuditEvent.EventType.MESSAGE_DELETED,
-                    MiniAppAuditEvent.Result.FAILED,
-                    bot_id=target.bot_id,
-                    bot_username=target.username,
-                    error_code=exc.__class__.__name__,
-                )
-            else:
-                await _record_mini_app_event(
-                    int(self.account["id"]),
-                    decision.rule.id,
-                    MiniAppAuditEvent.EventType.MESSAGE_DELETED,
-                    MiniAppAuditEvent.Result.SUCCEEDED,
-                    bot_id=target.bot_id,
-                    bot_username=target.username,
-                )
-            if policy["block_bot"] and entity is not None:
+        primary_target, _primary_entity, primary_decision = matches[0]
+        primary_rule = primary_decision.rule
+        if primary_rule is None:
+            return False
+        try:
+            await self._delete_with_retry(message, revoke=is_outgoing)
+        except Exception as exc:
+            await _record_mini_app_event(
+                int(self.account["id"]),
+                primary_rule.id,
+                MiniAppAuditEvent.EventType.MESSAGE_DELETED,
+                MiniAppAuditEvent.Result.FAILED,
+                bot_id=primary_target.bot_id,
+                bot_username=primary_target.username,
+                error_code=exc.__class__.__name__,
+            )
+        else:
+            await _record_mini_app_event(
+                int(self.account["id"]),
+                primary_rule.id,
+                MiniAppAuditEvent.EventType.MESSAGE_DELETED,
+                MiniAppAuditEvent.Result.SUCCEEDED,
+                bot_id=primary_target.bot_id,
+                bot_username=primary_target.username,
+            )
+        handled_entities: set[int] = set()
+        for target, entity, decision in matches:
+            entity_id = int(getattr(entity, "id", 0)) if entity is not None else 0
+            if entity is not None and entity_id not in handled_entities:
+                handled_entities.add(entity_id)
                 await self._block_bot(decision, target, entity)
-            return True
-        return False
+                await self._delete_forbidden_dialog(decision, target, entity)
+        return True
 
     async def _record_mini_app_detection(
         self,
-        policy: dict[str, Any],
+        _policy: dict[str, Any],
         decision: MiniAppRuleDecision,
         event_type: str,
         target: MiniAppTarget,
     ) -> None:
         if not decision.rule:
             return
-        mode = str(policy["mode"])
-        result = (
-            MiniAppAuditEvent.Result.OBSERVED
-            if mode == MiniAppPolicy.Mode.OBSERVE
-            else MiniAppAuditEvent.Result.WARNED
-            if mode == MiniAppPolicy.Mode.WARN
-            else MiniAppAuditEvent.Result.SUCCEEDED
-        )
+        result = MiniAppAuditEvent.Result.SUCCEEDED
         await _record_mini_app_event(
             int(self.account["id"]),
             decision.rule.id,
@@ -1067,56 +1288,6 @@ class AccountRunner:
             bot_id=target.bot_id,
             bot_username=target.username,
         )
-        if mode == MiniAppPolicy.Mode.OBSERVE:
-            return
-        if policy["notify_user"] and target.bot_id not in self.warned_mini_app_bot_ids:
-            await self._notify_user(decision, target)
-            if target.bot_id is not None:
-                self.warned_mini_app_bot_ids.add(target.bot_id)
-        if policy["notify_operator"]:
-            await _notify_mini_app_operator(
-                int(self.account["id"]),
-                decision.rule.id,
-                event_type,
-                target.bot_id,
-                target.username,
-                result,
-            )
-
-    async def _notify_user(
-        self, decision: MiniAppRuleDecision, target: MiniAppTarget
-    ) -> None:
-        if not self.client or not decision.rule:
-            return
-        identifier = f"@{target.username}" if target.username else f"bot_id={target.bot_id or '-'}"
-        try:
-            warning = (
-                f"{MINI_APP_WARNING_PREFIX} сработало правило "
-                f"#{decision.rule.id} для {identifier}."
-            )
-            await self.client.send_message(
-                "me",
-                warning,
-            )
-        except Exception as exc:
-            await _record_mini_app_event(
-                int(self.account["id"]),
-                decision.rule.id,
-                MiniAppAuditEvent.EventType.USER_WARNED,
-                MiniAppAuditEvent.Result.FAILED,
-                bot_id=target.bot_id,
-                bot_username=target.username,
-                error_code=exc.__class__.__name__,
-            )
-        else:
-            await _record_mini_app_event(
-                int(self.account["id"]),
-                decision.rule.id,
-                MiniAppAuditEvent.EventType.USER_WARNED,
-                MiniAppAuditEvent.Result.SUCCEEDED,
-                bot_id=target.bot_id,
-                bot_username=target.username,
-            )
 
     async def _delete_with_retry(self, event: Any, *, revoke: bool = True) -> None:
         for attempt in range(3):

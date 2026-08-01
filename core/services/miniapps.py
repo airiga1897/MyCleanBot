@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 
-from core.models import MiniAppRule, TelegramAccount
+from core.models import MiniAppRule, MiniAppRulePattern, TelegramAccount
 from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
 
 MAX_MATCH_TEXT = 2000
@@ -34,6 +34,7 @@ class MiniAppRuleSpec:
     match_type: str
     value: str
     bot_id: int | None
+    values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,13 +98,28 @@ def normalize_rule_value(match_type: str, value: str) -> tuple[str, int | None]:
 def create_mini_app_rule(
     account: TelegramAccount, list_type: str, match_type: str, value: str
 ) -> MiniAppRule:
-    normalized, bot_id = normalize_rule_value(match_type, value)
-    digest = fingerprint(f"miniapp:{account.pk}:{list_type}:{match_type}:{normalized}")
+    raw_values = (
+        [line for line in value.splitlines() if line.strip()]
+        if match_type == MiniAppRule.MatchType.KEYWORD
+        else [value]
+    )
+    normalized_values: list[str] = []
+    bot_id: int | None = None
+    for raw_value in raw_values:
+        normalized, candidate_bot_id = normalize_rule_value(match_type, raw_value)
+        if normalized not in normalized_values:
+            normalized_values.append(normalized)
+        if candidate_bot_id is not None:
+            bot_id = candidate_bot_id
+    if not normalized_values:
+        raise ValidationError("Добавьте хотя бы одну фразу.")
+    identity = "\n".join(sorted(normalized_values))
+    digest = fingerprint(f"miniapp:{account.pk}:{list_type}:{match_type}:{identity}")
     encrypted = ""
     if match_type != MiniAppRule.MatchType.BOT_ID:
-        encrypted = encrypt_for_user(account.user, normalized)
+        encrypted = encrypt_for_user(account.user, normalized_values[0])
     try:
-        return MiniAppRule.objects.create(
+        rule = MiniAppRule.objects.create(
             account=account,
             list_type=list_type,
             match_type=match_type,
@@ -111,25 +127,44 @@ def create_mini_app_rule(
             encrypted_pattern=encrypted,
             pattern_fingerprint=digest,
         )
+        if match_type != MiniAppRule.MatchType.BOT_ID:
+            MiniAppRulePattern.objects.bulk_create(
+                [
+                    MiniAppRulePattern(
+                        rule=rule,
+                        encrypted_pattern=encrypt_for_user(account.user, item),
+                        pattern_fingerprint=fingerprint(
+                            f"miniapp-pattern:{account.pk}:{rule.pk}:{item}"
+                        ),
+                    )
+                    for item in normalized_values
+                ]
+            )
+        return rule
     except IntegrityError as exc:
         raise DuplicateMiniAppRuleError from exc
 
 
 def load_mini_app_rules(account: TelegramAccount) -> list[MiniAppRuleSpec]:
     rules: list[MiniAppRuleSpec] = []
-    for rule in account.mini_app_rules.filter(active=True):
-        value = (
-            str(rule.bot_id)
-            if rule.match_type == MiniAppRule.MatchType.BOT_ID
-            else decrypt_for_user(account.user, rule.encrypted_pattern)
-        )
+    queryset = account.mini_app_rules.filter(active=True).prefetch_related("patterns")
+    for rule in queryset:
+        values: tuple[str, ...]
+        if rule.match_type == MiniAppRule.MatchType.BOT_ID:
+            values = (str(rule.bot_id),)
+        else:
+            values = tuple(
+                decrypt_for_user(account.user, pattern.encrypted_pattern)
+                for pattern in rule.patterns.all()
+            ) or (decrypt_for_user(account.user, rule.encrypted_pattern),)
         rules.append(
             MiniAppRuleSpec(
                 id=rule.pk,
                 list_type=rule.list_type,
                 match_type=rule.match_type,
-                value=value,
+                value=values[0],
                 bot_id=rule.bot_id,
+                values=values,
             )
         )
     return rules
@@ -137,13 +172,15 @@ def load_mini_app_rules(account: TelegramAccount) -> list[MiniAppRuleSpec]:
 
 def display_mini_app_rules(account: TelegramAccount) -> list[tuple[MiniAppRule, str]]:
     displayed: list[tuple[MiniAppRule, str]] = []
-    for rule in account.mini_app_rules.all():
-        value = (
-            str(rule.bot_id)
-            if rule.match_type == MiniAppRule.MatchType.BOT_ID
-            else decrypt_for_user(account.user, rule.encrypted_pattern)
-        )
-        displayed.append((rule, value))
+    for rule in account.mini_app_rules.prefetch_related("patterns").all():
+        if rule.match_type == MiniAppRule.MatchType.BOT_ID:
+            values = [str(rule.bot_id)]
+        else:
+            values = [
+                decrypt_for_user(account.user, pattern.encrypted_pattern)
+                for pattern in rule.patterns.all()
+            ] or [decrypt_for_user(account.user, rule.encrypted_pattern)]
+        displayed.append((rule, " · ".join(values)))
     return displayed
 
 
@@ -168,18 +205,22 @@ def extract_bot_usernames(text: str) -> set[str]:
 def _rule_matches(rule: MiniAppRuleSpec, target: MiniAppTarget, text: str) -> bool:
     if rule.match_type == MiniAppRule.MatchType.BOT_ID:
         return target.bot_id is not None and target.bot_id == rule.bot_id
+    values = rule.values or (rule.value,)
     if rule.match_type == MiniAppRule.MatchType.USERNAME:
-        return bool(target.username) and target.username.casefold() == rule.value
+        return bool(target.username) and any(
+            target.username.casefold() == value for value in values
+        )
     if rule.match_type == MiniAppRule.MatchType.TITLE:
-        return (
-            (bool(target.title) and target.title.casefold() == rule.value)
-            or rule.value in text[:MAX_MATCH_TEXT].casefold()
+        return any(
+            (bool(target.title) and target.title.casefold() == value)
+            or value in text[:MAX_MATCH_TEXT].casefold()
+            for value in values
         )
     haystack = " ".join(part for part in (target.title, text[:MAX_MATCH_TEXT]) if part)
     if rule.match_type == MiniAppRule.MatchType.KEYWORD:
-        return rule.value in haystack.casefold()
+        return any(value in haystack.casefold() for value in values)
     if rule.match_type == MiniAppRule.MatchType.REGEX:
-        return re.search(rule.value, haystack, re.IGNORECASE) is not None
+        return any(re.search(value, haystack, re.IGNORECASE) is not None for value in values)
     return False
 
 

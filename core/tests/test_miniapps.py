@@ -63,6 +63,30 @@ def test_rule_values_are_normalized_encrypted_and_unique() -> None:
         )
 
 
+def test_keyword_rule_supports_multiple_encrypted_or_patterns() -> None:
+    user = User.objects.create_user("mini-or-owner", password="long-password-123")
+    account = TelegramAccount.objects.create(user=user)
+    rule = create_mini_app_rule(
+        account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.KEYWORD,
+        "Lucid_Dreams\nDream App\nlucid_dreams",
+    )
+
+    spec = load_mini_app_rules(account)[0]
+    assert spec.values == ("lucid_dreams", "dream app")
+    assert rule.patterns.count() == 2
+    assert "lucid_dreams" not in rule.encrypted_pattern
+    assert all(
+        "dream" not in pattern.encrypted_pattern.casefold()
+        for pattern in rule.patterns.all()
+    )
+    assert decide_mini_app_rule(
+        [spec], MiniAppTarget(title="My Dream App")
+    ).denied
+    assert display_mini_app_rules(account)[0][1] == "lucid_dreams · dream app"
+
+
 @pytest.mark.parametrize(
     ("match_type", "value"),
     [

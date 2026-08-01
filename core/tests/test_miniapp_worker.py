@@ -35,6 +35,7 @@ class MockTelegramApi:
         self.requests: list[Any] = []
         self.sent_messages: list[str] = []
         self.bot = SimpleNamespace(id=4242, username="bad_bot", bot=True)
+        self.deleted_dialogs: list[Any] = []
 
     async def __call__(self, request: Any) -> Any:
         self.requests.append(request)
@@ -54,6 +55,14 @@ class MockTelegramApi:
         self.sent_messages.append(text)
         return SimpleNamespace(id=99)
 
+    async def delete_dialog(self, entity: Any, revoke: bool = False) -> None:
+        assert not revoke
+        self.deleted_dialogs.append(entity)
+
+    async def iter_dialogs(self) -> Any:
+        if False:
+            yield None
+
 
 class FailingTelegramApi(MockTelegramApi):
     async def __call__(self, request: Any) -> Any:
@@ -65,9 +74,12 @@ class FailingTelegramApi(MockTelegramApi):
     async def send_message(self, peer: str, text: str) -> Any:
         raise ConnectionError("mock-notification-failure")
 
+    async def delete_dialog(self, entity: Any, revoke: bool = False) -> None:
+        raise RuntimeError("mock-delete-dialog-failure")
+
 
 class OutgoingEvent:
-    def __init__(self, text: str, chat: Any | None = None) -> None:
+    def __init__(self, text: str, chat: Any | None = None, *, outgoing: bool = True) -> None:
         self.raw_text = text
         self.chat_id = 100
         self.is_private = True
@@ -75,9 +87,10 @@ class OutgoingEvent:
         self.message = SimpleNamespace(id=7, entities=[], media=None)
         self.deleted = False
         self.chat = chat
+        self.out = outgoing
 
     async def delete(self, revoke: bool) -> None:
-        assert revoke
+        assert revoke == self.out
         self.deleted = True
 
     async def get_chat(self) -> Any:
@@ -102,30 +115,6 @@ async def _account_with_rule(mode: str) -> tuple[TelegramAccount, MiniAppPolicy]
     return account, policy
 
 
-async def test_observe_reconcile_only_audits_mocked_attachment_menu() -> None:
-    account, _policy = await _account_with_rule(MiniAppPolicy.Mode.OBSERVE)
-    api = MockTelegramApi()
-    runner = worker.AccountRunner(
-        {"id": account.pk, "user_id": account.user_id, "encrypted_session": "unused"}
-    )
-    runner.client = api
-
-    await runner._reconcile_mini_apps()
-
-    assert any(
-        isinstance(request, functions.messages.GetAttachMenuBotsRequest)
-        for request in api.requests
-    )
-    assert not any(
-        isinstance(request, functions.messages.ToggleBotInAttachMenuRequest)
-        for request in api.requests
-    )
-    event = await MiniAppAuditEvent.objects.aget(account=account)
-    assert event.event_type == MiniAppAuditEvent.EventType.MENU_DETECTED
-    assert event.result == MiniAppAuditEvent.Result.OBSERVED
-    assert event.bot_id == 4242
-
-
 async def test_enforce_reconcile_disables_menu_and_blocks_bot() -> None:
     account, _policy = await _account_with_rule(MiniAppPolicy.Mode.ENFORCE)
     api = MockTelegramApi()
@@ -141,6 +130,7 @@ async def test_enforce_reconcile_disables_menu_and_blocks_bot() -> None:
         for request in api.requests
     )
     assert any(isinstance(request, functions.contacts.BlockRequest) for request in api.requests)
+    assert api.deleted_dialogs == [api.bot]
     event_types = {
         event_type
         async for event_type in MiniAppAuditEvent.objects.filter(account=account).values_list(
@@ -171,21 +161,79 @@ async def test_enforce_deletes_outgoing_after_update_and_audits_no_text() -> Non
     assert not hasattr(audit, "message_text")
 
 
-async def test_warn_does_not_delete_and_sends_minimal_saved_message() -> None:
-    account, policy = await _account_with_rule(MiniAppPolicy.Mode.WARN)
-    policy.notify_user = True
-    await policy.asave(update_fields=["notify_user"])
+async def test_incoming_link_from_another_bot_is_deleted_and_source_bot_removed() -> None:
+    account, _policy = await _account_with_rule(MiniAppPolicy.Mode.ENFORCE)
     api = MockTelegramApi()
     runner = worker.AccountRunner(
         {"id": account.pk, "user_id": account.user_id, "encrypted_session": "unused"}
     )
     runner.client = api
-    event = OutgoingEvent("/run@bad_bot")
+    source_bot = SimpleNamespace(id=5151, username="linker_bot", bot=True)
+    event = OutgoingEvent(
+        "Open https://t.me/bad_bot?startapp=lucid", source_bot, outgoing=False
+    )
 
-    assert not await runner._handle_mini_app_message(event, event.raw_text)
-    assert not event.deleted
-    assert api.sent_messages
-    assert event.raw_text not in api.sent_messages[0]
+    assert await runner._handle_mini_app_message(
+        event, event.raw_text, is_outgoing=False
+    )
+    assert event.deleted
+    assert api.deleted_dialogs == [source_bot, api.bot]
+    assert any(isinstance(request, functions.contacts.BlockRequest) for request in api.requests)
+    event_types = {
+        item async for item in MiniAppAuditEvent.objects.filter(account=account).values_list(
+            "event_type", flat=True
+        )
+    }
+    assert MiniAppAuditEvent.EventType.INCOMING_DETECTED in event_types
+
+
+async def test_profile_description_is_reconciled_and_bot_history_is_deleted() -> None:
+    user = await User.objects.acreate_user(
+        "profile-mini-user", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+    await worker.sync_to_async(create_mini_app_rule)(
+        account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.KEYWORD,
+        "lucid_dreams",
+    )
+    profile_bot = SimpleNamespace(id=9090, username="ordinary_bot", bot=True)
+
+    class ProfileApi(MockTelegramApi):
+        async def __call__(self, request: Any) -> Any:
+            self.requests.append(request)
+            if isinstance(request, functions.messages.GetAttachMenuBotsRequest):
+                return SimpleNamespace(bots=[], users=[])
+            if isinstance(request, functions.users.GetFullUserRequest):
+                return SimpleNamespace(
+                    full_user=SimpleNamespace(about="Launch lucid_dreams here")
+                )
+            return True
+
+        async def iter_dialogs(self) -> Any:
+            yield SimpleNamespace(
+                id=profile_bot.id,
+                entity=profile_bot,
+                name="Ordinary bot",
+                is_group=False,
+                is_channel=False,
+            )
+
+    api = ProfileApi()
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": account.user_id, "encrypted_session": "unused"}
+    )
+    runner.client = api
+
+    await runner._reconcile_mini_apps()
+
+    assert api.deleted_dialogs == [profile_bot]
+    assert any(isinstance(request, functions.contacts.BlockRequest) for request in api.requests)
+    assert await MiniAppAuditEvent.objects.filter(
+        account=account,
+        event_type=MiniAppAuditEvent.EventType.PROFILE_DETECTED,
+    ).aexists()
 
 
 async def test_bare_command_in_private_bot_chat_is_matched() -> None:
@@ -221,28 +269,9 @@ async def test_enforcement_action_failures_are_minimally_audited() -> None:
     assert {event.event_type for event in failures} == {
         MiniAppAuditEvent.EventType.MENU_DISABLED,
         MiniAppAuditEvent.EventType.BOT_BLOCKED,
+        MiniAppAuditEvent.EventType.DIALOG_DELETED,
     }
     assert all(event.error_code == "RuntimeError" for event in failures)
-
-
-async def test_user_notification_failure_is_audited_without_message_text() -> None:
-    account, policy = await _account_with_rule(MiniAppPolicy.Mode.WARN)
-    policy.notify_user = True
-    await policy.asave(update_fields=["notify_user"])
-    api = FailingTelegramApi()
-    runner = worker.AccountRunner(
-        {"id": account.pk, "user_id": account.user_id, "encrypted_session": "unused"}
-    )
-    runner.client = api
-    event = OutgoingEvent("@bad_bot")
-
-    assert not await runner._handle_mini_app_message(event, event.raw_text)
-    audit = await MiniAppAuditEvent.objects.filter(
-        account=account,
-        event_type=MiniAppAuditEvent.EventType.USER_WARNED,
-    ).aget()
-    assert audit.result == MiniAppAuditEvent.Result.FAILED
-    assert audit.error_code == "ConnectionError"
 
 
 async def test_operator_notification_deduplicates_and_reconcile_error(

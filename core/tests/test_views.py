@@ -50,10 +50,51 @@ def test_invitation_is_single_use(client: Client) -> None:
         },
     )
     assert response.status_code == 302
+    assert response.url == reverse("login")
+    assert "_auth_user_id" not in client.session
     invite.refresh_from_db()
     assert invite.consumed_at is not None
-    client.logout()
     assert client.get(reverse("register_invite", kwargs={"token": token})).status_code == 404
+
+
+def test_invitation_registration_uses_fresh_login_form_without_rotating_csrf() -> None:
+    client = Client(enforce_csrf_checks=True)
+    admin = User.objects.create_superuser(
+        "csrf-admin", "csrf-admin@example.test", "admin-password-123"
+    )
+    _invite, token = Invitation.issue(admin)
+    invite_url = reverse("register_invite", kwargs={"token": token})
+    assert client.get(invite_url).status_code == 200
+    csrf_before = client.cookies["csrftoken"].value
+
+    response = client.post(
+        invite_url,
+        {
+            "username": "csrf-new-user",
+            "password1": "long-password-123",
+            "password2": "long-password-123",
+            "csrfmiddlewaretoken": csrf_before,
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.url == reverse("login")
+    assert client.cookies["csrftoken"].value == csrf_before
+    assert "_auth_user_id" not in client.session
+    login_page = client.get(response.url)
+    assert login_page.status_code == 200
+    assert "Аккаунт создан" in login_page.content.decode()
+
+    login_response = client.post(
+        reverse("login"),
+        {
+            "username": "csrf-new-user",
+            "password": "long-password-123",
+            "csrfmiddlewaretoken": csrf_before,
+        },
+    )
+    assert login_response.status_code == 302
+    assert login_response.url == reverse("dashboard")
 
 
 def test_expired_invitation_is_rejected(client: Client) -> None:
@@ -336,6 +377,8 @@ def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
     assert "visible_bot" in body
     assert "hidden_bot" not in body
     assert "hidden_audit_bot" not in body
+    assert "Прямая ссылка на Mini App может открыться" in body
+    assert "проверяются автоматически в фоне" in body
     response = client.post(
         reverse("delete_mini_app_rule", kwargs={"rule_id": owner_rule.pk})
     )
@@ -360,9 +403,7 @@ def test_user_cannot_delete_another_accounts_mini_app_rule(client: Client) -> No
     assert MiniAppRule.objects.filter(pk=rule.pk).exists()
 
 
-def test_mini_app_policy_defaults_to_observe_and_enforce_needs_confirmation(
-    client: Client,
-) -> None:
+def test_mini_app_policy_is_always_hard_without_extra_settings(client: Client) -> None:
     user = User.objects.create_user("mini-policy-owner", password="long-password-123")
     account = TelegramAccount.objects.create(user=user)
     client.force_login(user)
@@ -370,66 +411,32 @@ def test_mini_app_policy_defaults_to_observe_and_enforce_needs_confirmation(
     page = client.get(reverse("mini_app_settings"))
     policy = MiniAppPolicy.objects.get(account=account)
     assert page.status_code == 200
-    assert policy.mode == MiniAppPolicy.Mode.OBSERVE
-
-    response = client.post(
-        reverse("mini_app_settings"),
-        {
-            "mode": MiniAppPolicy.Mode.ENFORCE,
-            "block_bot": "on",
-            "notify_user": "on",
-        },
-    )
-    assert response.status_code == 200
-    policy.refresh_from_db()
-    assert policy.mode == MiniAppPolicy.Mode.OBSERVE
-
-    response = client.post(
-        reverse("mini_app_settings"),
-        {
-            "mode": MiniAppPolicy.Mode.ENFORCE,
-            "block_bot": "on",
-            "notify_user": "on",
-            "confirm_enforce": "on",
-        },
-    )
-    assert response.status_code == 302
-    policy.refresh_from_db()
     assert policy.mode == MiniAppPolicy.Mode.ENFORCE
+    assert policy.block_bot
+    assert not policy.notify_user
+    body = page.content.decode()
+    assert "Наблюдение" not in body
+    assert "Предупреждение" not in body
+    assert "подтверждаю включение" not in body
+    assert "Всегда используется жёсткое ограничение" in body
 
 
-def test_add_mini_app_rule_validates_regex(client: Client) -> None:
-    user = User.objects.create_user("mini-regex-owner", password="long-password-123")
+def test_add_mini_app_rule_creates_hard_keyword_rule(client: Client) -> None:
+    user = User.objects.create_user("mini-keyword-owner", password="long-password-123")
     TelegramAccount.objects.create(user=user)
     client.force_login(user)
     response = client.post(
         reverse("add_mini_app_rule"),
-        {
-            "list_type": MiniAppRule.ListType.DENY,
-            "match_type": MiniAppRule.MatchType.REGEX,
-            "value": "(a+)+",
-        },
+        {"value": "lucid_dreams\nDream App"},
     )
     assert response.status_code == 302
-    assert not MiniAppRule.objects.exists()
-
-
-def test_warn_policy_accepts_operator_dashboard_notifications(client: Client) -> None:
-    user = User.objects.create_user("mini-warn-owner", password="long-password-123")
-    account = TelegramAccount.objects.create(user=user)
-    client.force_login(user)
-
-    response = client.post(
-        reverse("mini_app_settings"),
-        {
-            "mode": MiniAppPolicy.Mode.WARN,
-            "notify_operator": "on",
-        },
-    )
-    assert response.status_code == 302
-    policy = MiniAppPolicy.objects.get(account=account)
-    assert policy.mode == MiniAppPolicy.Mode.WARN
-    assert policy.notify_operator
+    rule = MiniAppRule.objects.get()
+    assert rule.list_type == MiniAppRule.ListType.DENY
+    assert rule.match_type == MiniAppRule.MatchType.KEYWORD
+    assert rule.patterns.count() == 2
+    scan = HistoryScan.objects.get(account__user=user)
+    assert scan.phase == HistoryScan.Phase.ENFORCE
+    assert scan.status == HistoryScan.Status.QUEUED
 
 
 def test_qr_and_phone_auth_views(client: Client) -> None:
