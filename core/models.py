@@ -398,6 +398,13 @@ class MiniAppRule(models.Model):
     account = models.ForeignKey(
         TelegramAccount, on_delete=models.CASCADE, related_name="mini_app_rules"
     )
+    protection_rule = models.OneToOneField(
+        ForbiddenRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="legacy_mini_app_rule",
+    )
     list_type = models.CharField(max_length=8, choices=ListType.choices)
     match_type = models.CharField(max_length=16, choices=MatchType.choices)
     bot_id = models.BigIntegerField(null=True, blank=True)
@@ -466,6 +473,13 @@ class MiniAppAuditEvent(models.Model):
     rule = models.ForeignKey(
         MiniAppRule, on_delete=models.SET_NULL, null=True, blank=True, related_name="events"
     )
+    protection_rule = models.ForeignKey(
+        ForbiddenRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mini_app_events",
+    )
     event_type = models.CharField(max_length=32, choices=EventType.choices)
     bot_id = models.BigIntegerField(null=True, blank=True)
     bot_username = models.CharField(max_length=64, blank=True)
@@ -489,6 +503,13 @@ class OperatorNotification(models.Model):
     )
     rule = models.ForeignKey(
         MiniAppRule, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    protection_rule = models.ForeignKey(
+        ForbiddenRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="operator_notifications",
     )
     event_type = models.CharField(
         max_length=32,

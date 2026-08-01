@@ -14,7 +14,6 @@
     {% if user.is_authenticated %}
       <nav aria-label="Основное меню">
         <a href="{% url 'dashboard' %}">Личный кабинет</a>
-        <a href="{% url 'mini_app_settings' %}">Mini Apps</a>
         {% if user.is_staff %}<a href="{% url 'operator_dashboard' %}">Оператор{% if operator_notification_count %} ({{ operator_notification_count }}){% endif %}</a>{% endif %}
       </nav>
       <span class="username">{{ user.username }}</span>

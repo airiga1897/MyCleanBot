@@ -36,7 +36,7 @@ from core.models import (
     ForbiddenRule,
     HistoryScan,
     Invitation,
-    MiniAppPolicy,
+    MiniAppAuditEvent,
     MiniAppRule,
     OperatorNotification,
     RuleChangeRequest,
@@ -46,11 +46,6 @@ from core.models import (
 )
 from core.services.crypto import decrypt_for_user, encrypt_for_user
 from core.services.matcher import normalize_text
-from core.services.miniapps import (
-    DuplicateMiniAppRuleError,
-    create_mini_app_rule,
-    display_mini_app_rules,
-)
 from core.services.rules import (
     DuplicateRuleError,
     PendingRuleChangeError,
@@ -109,6 +104,16 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         ),
         failed=Count("id", filter=Q(result=FilterEvent.Result.FAILED)),
     )
+    mini_app_events = account.mini_app_events.select_related(
+        "rule", "protection_rule"
+    )[:100]
+    mini_app_stats = account.mini_app_events.filter(created_at__gte=since).aggregate(
+        total=Count("id"),
+        successful=Count(
+            "id", filter=Q(result=MiniAppAuditEvent.Result.SUCCEEDED)
+        ),
+        failed=Count("id", filter=Q(result=MiniAppAuditEvent.Result.FAILED)),
+    )
     pending_disconnect = user.disconnect_requests.filter(
         status=DisconnectRequest.Status.PENDING
     ).exists()
@@ -138,6 +143,8 @@ def dashboard(request: HttpRequest) -> HttpResponse:
             ),
             "events": events,
             "event_stats": event_stats,
+            "mini_app_events": mini_app_events,
+            "mini_app_stats": mini_app_stats,
             "pending_disconnect": pending_disconnect,
         },
     )
@@ -163,6 +170,16 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
         ),
         failed=Count("id", filter=Q(result=FilterEvent.Result.FAILED)),
     )
+    mini_events = list(
+        account.mini_app_events.select_related("rule", "protection_rule")[:100]
+    )
+    mini_stats = account.mini_app_events.filter(created_at__gte=since).aggregate(
+        total=Count("id"),
+        successful=Count(
+            "id", filter=Q(result=MiniAppAuditEvent.Result.SUCCEEDED)
+        ),
+        failed=Count("id", filter=Q(result=MiniAppAuditEvent.Result.FAILED)),
+    )
     history_scan = account.history_scans.first()
     rule_scans: dict[int, HistoryScan] = {}
     for scan in account.history_scans.filter(rule_id__isnull=False):
@@ -182,6 +199,7 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
                 "last_update_result": account.last_update_result,
             },
             "stats": stats,
+            "mini_app_stats": mini_stats,
             "history_scan": (
                 {
                     "id": history_scan.pk,
@@ -221,6 +239,18 @@ def dashboard_status(request: HttpRequest) -> JsonResponse:
                 }
                 for event in events
             ],
+            "mini_app_events": [
+                {
+                    "created_at": event.created_at.isoformat(),
+                    "rule_id": event.protection_rule_id,
+                    "legacy_rule_id": event.rule_id,
+                    "event_type": event.get_event_type_display(),
+                    "bot_id": event.bot_id,
+                    "bot_username": event.bot_username,
+                    "result": event.get_result_display(),
+                }
+                for event in mini_events
+            ],
         }
     )
 
@@ -258,8 +288,8 @@ def add_rule(request: HttpRequest) -> HttpResponse:
                 form.cleaned_data["phrases"],
                 label=form.cleaned_data["label"],
                 direction=form.cleaned_data["direction"],
-                mode=form.cleaned_data["mode"],
-                is_locked=form.cleaned_data["is_locked"],
+                mode=ForbiddenRule.Mode.ENFORCE,
+                is_locked=True,
                 dialog_ids=[
                     item.pk for item in form.cleaned_data["dialogs"]
                 ],
@@ -300,8 +330,8 @@ def edit_rule(request: HttpRequest, rule_id: int) -> HttpResponse:
                 label=form.cleaned_data["label"],
                 phrases=form.cleaned_data["phrases"],
                 direction=form.cleaned_data["direction"],
-                mode=form.cleaned_data["mode"],
-                is_locked=form.cleaned_data["is_locked"],
+                mode=ForbiddenRule.Mode.ENFORCE,
+                is_locked=True,
                 dialog_ids=[item.pk for item in form.cleaned_data["dialogs"]],
             )
         except PendingRuleChangeError:
@@ -354,14 +384,10 @@ def cancel_rule_change(request: HttpRequest, rule_id: int) -> HttpResponse:
 def request_rule_removal(request: HttpRequest, rule_id: int) -> HttpResponse:
     user = _authenticated_user(request)
     rule = get_object_or_404(ForbiddenRule, pk=rule_id, user=user)
-    if rule.is_locked:
-        RuleRemovalRequest.objects.get_or_create(
-            user=user, rule=rule, status=RuleRemovalRequest.Status.PENDING
-        )
-        messages.success(request, "Запрос на удаление отправлен оператору.")
-    else:
-        rule.delete()
-        messages.success(request, "Правило удалено.")
+    RuleRemovalRequest.objects.get_or_create(
+        user=user, rule=rule, status=RuleRemovalRequest.Status.PENDING
+    )
+    messages.success(request, "Запрос на удаление отправлен оператору.")
     return redirect("dashboard")
 
 
@@ -529,29 +555,7 @@ def request_disconnect(request: HttpRequest) -> HttpResponse:
 @login_required
 @require_http_methods(["GET"])
 def mini_app_settings(request: HttpRequest) -> HttpResponse:
-    user = _authenticated_user(request)
-    account, _ = TelegramAccount.objects.get_or_create(user=user)
-    policy, _ = MiniAppPolicy.objects.update_or_create(
-        account=account,
-        defaults={
-            "mode": MiniAppPolicy.Mode.ENFORCE,
-            "block_bot": True,
-            "notify_user": False,
-            "notify_admin": False,
-            "notify_operator": False,
-        },
-    )
-    return render(
-        request,
-        "core/mini_app_settings.html",
-        {
-            "account": account,
-            "policy": policy,
-            "rule_form": MiniAppRuleForm(),
-            "mini_app_rules": display_mini_app_rules(account),
-            "mini_app_events": account.mini_app_events.select_related("rule")[:100],
-        },
-    )
+    return redirect(f"{reverse('dashboard')}#protection-rules")
 
 
 @login_required
@@ -562,13 +566,15 @@ def add_mini_app_rule(request: HttpRequest) -> HttpResponse:
     form = MiniAppRuleForm(request.POST)
     if form.is_valid():
         try:
-            create_mini_app_rule(
-                account,
-                MiniAppRule.ListType.DENY,
-                MiniAppRule.MatchType.KEYWORD,
+            create_rule(
+                user,
                 form.cleaned_data["value"],
+                direction=ForbiddenRule.Direction.BOTH,
+                mode=ForbiddenRule.Mode.ENFORCE,
+                is_locked=True,
+                queue_history=True,
             )
-        except DuplicateMiniAppRuleError:
+        except DuplicateRuleError:
             messages.error(request, "Такое правило уже существует.")
         else:
             if not account.history_scans.filter(
@@ -584,7 +590,7 @@ def add_mini_app_rule(request: HttpRequest) -> HttpResponse:
             )
     else:
         messages.error(request, "Правило не добавлено: проверьте тип и значение.")
-    return redirect("mini_app_settings")
+    return redirect(f"{reverse('dashboard')}#protection-rules")
 
 
 @login_required
@@ -592,9 +598,19 @@ def add_mini_app_rule(request: HttpRequest) -> HttpResponse:
 def delete_mini_app_rule(request: HttpRequest, rule_id: int) -> HttpResponse:
     user = _authenticated_user(request)
     rule = get_object_or_404(MiniAppRule, pk=rule_id, account__user=user)
-    rule.delete()
-    messages.success(request, "Правило Mini Apps удалено.")
-    return redirect("mini_app_settings")
+    if rule.protection_rule_id:
+        RuleRemovalRequest.objects.get_or_create(
+            user=user,
+            rule_id=rule.protection_rule_id,
+            status=RuleRemovalRequest.Status.PENDING,
+        )
+        messages.success(request, "Запрос на удаление отправлен оператору.")
+    else:
+        messages.error(
+            request,
+            "Служебное правило bot_id можно изменить только через оператора.",
+        )
+    return redirect(f"{reverse('dashboard')}#protection-rules")
 
 
 @login_required
@@ -729,7 +745,7 @@ def operator_dashboard(request: HttpRequest) -> HttpResponse:
     occupied = users.filter(is_active=True).count()
     notifications = list(
         OperatorNotification.objects.filter(processed_at__isnull=True)
-        .select_related("account__user", "rule")[:50]
+        .select_related("account__user", "rule", "protection_rule")[:50]
     )
     return render(
         request,

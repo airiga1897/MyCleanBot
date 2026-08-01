@@ -116,10 +116,10 @@ def test_locked_rule_weakening_is_atomic_and_requires_operator() -> None:
     resolve_rule_change(change, operator, approve=True)
     rule.refresh_from_db()
     assert rule.revision == 2
-    assert rule.mode == ForbiddenRule.Mode.WARN
-    assert not rule.is_locked
+    assert rule.mode == ForbiddenRule.Mode.ENFORCE
+    assert rule.is_locked
     assert decrypted_rules(user)[0].phrases == ("сильная",)
-    assert not HistoryScan.objects.filter(rule=rule).exists()
+    assert HistoryScan.objects.filter(rule=rule).exists()
 
 
 def test_strengthening_rule_applies_immediately_and_queues_history() -> None:

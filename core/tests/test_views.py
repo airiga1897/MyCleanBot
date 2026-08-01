@@ -15,7 +15,6 @@ from core.models import (
     HistoryScan,
     Invitation,
     MiniAppAuditEvent,
-    MiniAppPolicy,
     MiniAppRule,
     OperatorNotification,
     RuleChangeRequest,
@@ -291,15 +290,19 @@ def test_dashboard_masks_rules_and_isolates_user_data(client: Client) -> None:
     )
 
 
-def test_unlocked_rule_is_deleted_without_operator(client: Client) -> None:
+def test_all_rules_require_operator_removal_even_if_legacy_caller_requests_unlocked(
+    client: Client,
+) -> None:
     user = User.objects.create_user("unlocked-owner", password="long-password-123")
     TelegramAccount.objects.create(user=user)
     rule = create_rule(user, "temporary", is_locked=False)
     client.force_login(user)
     response = client.post(reverse("request_rule_removal", kwargs={"rule_id": rule.pk}))
     assert response.status_code == 302
-    assert not ForbiddenRule.objects.filter(pk=rule.pk).exists()
-    assert not RuleRemovalRequest.objects.exists()
+    rule.refresh_from_db()
+    assert rule.is_locked
+    assert ForbiddenRule.objects.filter(pk=rule.pk).exists()
+    assert RuleRemovalRequest.objects.filter(rule=rule, user=user).exists()
 
 
 def test_rule_test_does_not_create_audit_event(client: Client) -> None:
@@ -338,14 +341,32 @@ def test_dashboard_status_is_sanitized_and_user_scoped(client: Client) -> None:
         chat_type="group",
         result=FilterEvent.Result.FAILED,
     )
+    MiniAppAuditEvent.objects.create(
+        account=account,
+        protection_rule=rule,
+        event_type=MiniAppAuditEvent.EventType.BOT_BLOCKED,
+        bot_username="owner_bot",
+        result=MiniAppAuditEvent.Result.SUCCEEDED,
+    )
+    MiniAppAuditEvent.objects.create(
+        account=other.telegram_account,
+        protection_rule=other_rule,
+        event_type=MiniAppAuditEvent.EventType.BOT_BLOCKED,
+        bot_username="other_bot",
+        result=MiniAppAuditEvent.Result.FAILED,
+    )
     client.force_login(owner)
     payload = client.get(reverse("dashboard_status")).json()
     assert payload["account"]["status"] == account.get_status_display()
     assert payload["stats"] == {"total": 1, "successful": 1, "failed": 0}
     assert payload["events"][0]["rule_ids"] == [rule.pk]
+    assert payload["mini_app_stats"] == {"total": 1, "successful": 1, "failed": 0}
+    assert payload["mini_app_events"][0]["rule_id"] == rule.pk
+    assert payload["mini_app_events"][0]["bot_username"] == "owner_bot"
     serialized = str(payload)
     assert "never expose this" not in serialized
     assert "other secret" not in serialized
+    assert "other_bot" not in serialized
 
 
 def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
@@ -353,17 +374,14 @@ def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
     other = User.objects.create_user("mini-other", password="long-password-123")
     owner_account = TelegramAccount.objects.create(user=owner)
     other_account = TelegramAccount.objects.create(user=other)
-    owner_rule = create_mini_app_rule(
-        owner_account,
-        MiniAppRule.ListType.DENY,
-        MiniAppRule.MatchType.USERNAME,
-        "visible_bot",
-    )
-    create_mini_app_rule(
-        other_account,
-        MiniAppRule.ListType.DENY,
-        MiniAppRule.MatchType.USERNAME,
-        "hidden_bot",
+    owner_rule = create_rule(owner, "visible_bot")
+    create_rule(other, "hidden_bot")
+    MiniAppAuditEvent.objects.create(
+        account=owner_account,
+        protection_rule=owner_rule,
+        event_type=MiniAppAuditEvent.EventType.BOT_BLOCKED,
+        bot_username="visible_audit_bot",
+        result=MiniAppAuditEvent.Result.SUCCEEDED,
     )
     MiniAppAuditEvent.objects.create(
         account=other_account,
@@ -373,17 +391,15 @@ def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
     )
     client.force_login(owner)
 
-    body = client.get(reverse("mini_app_settings")).content.decode()
-    assert "visible_bot" in body
+    legacy_page = client.get(reverse("mini_app_settings"))
+    assert legacy_page.status_code == 302
+    assert legacy_page.url == f"{reverse('dashboard')}#protection-rules"
+    body = client.get(reverse("dashboard")).content.decode()
+    assert "visible_bot" not in body
     assert "hidden_bot" not in body
     assert "hidden_audit_bot" not in body
-    assert "Прямая ссылка на Mini App может открыться" in body
-    assert "проверяются автоматически в фоне" in body
-    response = client.post(
-        reverse("delete_mini_app_rule", kwargs={"rule_id": owner_rule.pk})
-    )
-    assert response.status_code == 302
-    assert not MiniAppRule.objects.filter(pk=owner_rule.pk).exists()
+    assert "visible_audit_bot" in body
+    assert "Уже открытый WebView Telegram закрыть удалённо нельзя" in body
 
 
 def test_user_cannot_delete_another_accounts_mini_app_rule(client: Client) -> None:
@@ -405,20 +421,17 @@ def test_user_cannot_delete_another_accounts_mini_app_rule(client: Client) -> No
 
 def test_mini_app_policy_is_always_hard_without_extra_settings(client: Client) -> None:
     user = User.objects.create_user("mini-policy-owner", password="long-password-123")
-    account = TelegramAccount.objects.create(user=user)
+    TelegramAccount.objects.create(user=user)
     client.force_login(user)
 
-    page = client.get(reverse("mini_app_settings"))
-    policy = MiniAppPolicy.objects.get(account=account)
+    page = client.get(reverse("mini_app_settings"), follow=True)
     assert page.status_code == 200
-    assert policy.mode == MiniAppPolicy.Mode.ENFORCE
-    assert policy.block_bot
-    assert not policy.notify_user
     body = page.content.decode()
     assert "Наблюдение" not in body
     assert "Предупреждение" not in body
     assert "подтверждаю включение" not in body
-    assert "Всегда используется жёсткое ограничение" in body
+    assert "Все правила работают в режиме жёсткого ограничения" in body
+    assert "Защитить правило" not in client.get(reverse("add_rule")).content.decode()
 
 
 def test_add_mini_app_rule_creates_hard_keyword_rule(client: Client) -> None:
@@ -430,13 +443,73 @@ def test_add_mini_app_rule_creates_hard_keyword_rule(client: Client) -> None:
         {"value": "lucid_dreams\nDream App"},
     )
     assert response.status_code == 302
-    rule = MiniAppRule.objects.get()
-    assert rule.list_type == MiniAppRule.ListType.DENY
-    assert rule.match_type == MiniAppRule.MatchType.KEYWORD
+    rule = ForbiddenRule.objects.get(user=user)
+    assert rule.active
+    assert rule.is_locked
+    assert rule.mode == ForbiddenRule.Mode.ENFORCE
     assert rule.patterns.count() == 2
     scan = HistoryScan.objects.get(account__user=user)
     assert scan.phase == HistoryScan.Phase.ENFORCE
     assert scan.status == HistoryScan.Status.QUEUED
+
+
+def test_legacy_mini_app_endpoints_preserve_protected_removal_contract(
+    client: Client,
+) -> None:
+    user = User.objects.create_user("legacy-mini-owner", password="long-password-123")
+    account = TelegramAccount.objects.create(user=user)
+    protection_rule = create_rule(user, "legacy keyword")
+    linked = create_mini_app_rule(
+        account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.KEYWORD,
+        "legacy keyword",
+    )
+    linked.protection_rule = protection_rule
+    linked.save(update_fields=["protection_rule"])
+    unlinked = create_mini_app_rule(
+        account,
+        MiniAppRule.ListType.DENY,
+        MiniAppRule.MatchType.BOT_ID,
+        "4242",
+    )
+    client.force_login(user)
+
+    response = client.post(
+        reverse("delete_mini_app_rule", kwargs={"rule_id": linked.pk})
+    )
+    assert response.status_code == 302
+    assert RuleRemovalRequest.objects.filter(
+        user=user, rule=protection_rule
+    ).exists()
+    assert MiniAppRule.objects.filter(pk=linked.pk).exists()
+
+    response = client.post(
+        reverse("delete_mini_app_rule", kwargs={"rule_id": unlinked.pk}),
+        follow=True,
+    )
+    assert response.status_code == 200
+    assert "только через оператора" in response.content.decode()
+    assert MiniAppRule.objects.filter(pk=unlinked.pk).exists()
+
+
+def test_legacy_add_mini_app_endpoint_rejects_invalid_and_duplicate(
+    client: Client,
+) -> None:
+    user = User.objects.create_user("legacy-mini-add", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+
+    invalid = client.post(reverse("add_mini_app_rule"), {"value": ""}, follow=True)
+    assert "Правило не добавлено" in invalid.content.decode()
+
+    create_rule(user, "duplicate mini phrase")
+    duplicate = client.post(
+        reverse("add_mini_app_rule"),
+        {"value": "DUPLICATE MINI PHRASE"},
+        follow=True,
+    )
+    assert "Такое правило уже существует" in duplicate.content.decode()
 
 
 def test_qr_and_phone_auth_views(client: Client) -> None:
@@ -647,17 +720,16 @@ def test_owner_can_cancel_pending_protected_rule_change(client: Client) -> None:
 
 
 @pytest.mark.parametrize(
-    ("decision", "expected_status", "expected_mode"),
+    ("decision", "expected_status"),
     [
-        ("approve", RuleChangeRequest.Status.APPROVED, ForbiddenRule.Mode.WARN),
-        ("reject", RuleChangeRequest.Status.REJECTED, ForbiddenRule.Mode.ENFORCE),
+        ("approve", RuleChangeRequest.Status.APPROVED),
+        ("reject", RuleChangeRequest.Status.REJECTED),
     ],
 )
 def test_operator_resolves_protected_rule_change(
     client: Client,
     decision: str,
     expected_status: str,
-    expected_mode: str,
 ) -> None:
     operator = User.objects.create_superuser(
         f"change-{decision}-operator",
@@ -695,7 +767,8 @@ def test_operator_resolves_protected_rule_change(
     rule.refresh_from_db()
     assert change.status == expected_status
     assert change.resolved_by == operator
-    assert rule.mode == expected_mode
+    assert rule.mode == ForbiddenRule.Mode.ENFORCE
+    assert rule.is_locked
     assert rule.revision == (2 if decision == "approve" else 1)
 
 

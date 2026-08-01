@@ -99,7 +99,7 @@
           <td>{{ item.account.user.username }}</td>
           <td>{{ item.first_seen_at }}<br>{{ item.last_seen_at }}</td>
                 <td>{{ item.get_event_type_display }}</td>
-          <td>{% if item.rule_id %}#{{ item.rule_id }}{% else %}—{% endif %}</td>
+          <td>{% if item.protection_rule_id %}#{{ item.protection_rule_id }}{% elif item.rule_id %}служебное #{{ item.rule_id }}{% else %}—{% endif %}</td>
           <td>{% if item.bot_id %}{{ item.bot_id }}{% endif %}{% if item.bot_username %} @{{ item.bot_username }}{% endif %}</td>
                 <td>{{ item.get_result_display }}</td>
           <td>{{ item.repeat_count }}</td>

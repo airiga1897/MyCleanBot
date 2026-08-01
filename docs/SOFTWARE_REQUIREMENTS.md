@@ -16,12 +16,12 @@
 - Phrase, MTProto session, phone, OTP и 2FA не логируются.
 - Phrase/session — envelope encrypted; transient auth secrets имеют TTL пять минут.
 - Отменённый или заменённый auth flow не может сохранить запоздавшую session.
-- Mini App rules принадлежат конкретному `TelegramAccount`; текстовые значения шифруются.
+- Единые правила принадлежат пользователю и применяются только к его `TelegramAccount`;
+  текстовые значения шифруются.
 - Mini App audit не содержит полный текст сообщений, session или WebView content.
 - Открытая фраза не включается в HTML списка и выдаётся только отдельным
   авторизованным `no-store` запросом.
-- Пользователь может удалить обычное правило сразу; protected removal и disconnect
-  требуют operator approval.
+- Удаление или ослабление любого правила и отключение Telegram требуют operator approval.
 
 ## Тестирование
 

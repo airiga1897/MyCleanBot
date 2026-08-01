@@ -6,9 +6,11 @@ from urllib.parse import parse_qs, urlparse
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 
-from core.models import MiniAppRule, MiniAppRulePattern, TelegramAccount
+from core.models import ForbiddenRule, MiniAppRule, MiniAppRulePattern, TelegramAccount
 from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
+from core.services.matcher import normalize_text
 
 MAX_MATCH_TEXT = 2000
 MAX_PATTERN_LENGTH = 200
@@ -29,12 +31,15 @@ class DuplicateMiniAppRuleError(ValueError):
 
 @dataclass(frozen=True)
 class MiniAppRuleSpec:
-    id: int
+    id: int | None
     list_type: str
     match_type: str
     value: str
     bot_id: int | None
     values: tuple[str, ...] = ()
+    protection_rule_id: int | None = None
+    direction: str = ForbiddenRule.Direction.BOTH
+    dialog_fingerprints: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,24 +152,58 @@ def create_mini_app_rule(
 
 def load_mini_app_rules(account: TelegramAccount) -> list[MiniAppRuleSpec]:
     rules: list[MiniAppRuleSpec] = []
-    queryset = account.mini_app_rules.filter(active=True).prefetch_related("patterns")
-    for rule in queryset:
+    protection_rules = (
+        account.user.forbidden_rules.filter(active=True)
+        .prefetch_related("patterns", "dialog_scopes__dialog")
+        .order_by("id")
+    )
+    for protection_rule in protection_rules:
+        protection_values = tuple(
+            normalize_text(decrypt_for_user(account.user, pattern.encrypted_phrase))
+            for pattern in protection_rule.patterns.all()
+        ) or (
+            normalize_text(
+                decrypt_for_user(account.user, protection_rule.encrypted_phrase)
+            ),
+        )
+        scopes = frozenset(
+            scope.dialog.peer_fingerprint
+            for scope in protection_rule.dialog_scopes.all()
+        )
+        rules.append(
+            MiniAppRuleSpec(
+                id=None,
+                protection_rule_id=protection_rule.pk,
+                list_type=MiniAppRule.ListType.DENY,
+                match_type=MiniAppRule.MatchType.KEYWORD,
+                value=protection_values[0],
+                values=protection_values,
+                bot_id=None,
+                direction=protection_rule.direction,
+                dialog_fingerprints=scopes or None,
+            )
+        )
+    queryset = account.mini_app_rules.filter(active=True).filter(
+        Q(protection_rule__isnull=True) | Q(match_type=MiniAppRule.MatchType.BOT_ID)
+    ).prefetch_related("patterns")
+    for legacy_rule in queryset:
         values: tuple[str, ...]
-        if rule.match_type == MiniAppRule.MatchType.BOT_ID:
-            values = (str(rule.bot_id),)
+        if legacy_rule.match_type == MiniAppRule.MatchType.BOT_ID:
+            values = (str(legacy_rule.bot_id),)
         else:
             values = tuple(
                 decrypt_for_user(account.user, pattern.encrypted_pattern)
-                for pattern in rule.patterns.all()
-            ) or (decrypt_for_user(account.user, rule.encrypted_pattern),)
+                for pattern in legacy_rule.patterns.all()
+            ) or (decrypt_for_user(account.user, legacy_rule.encrypted_pattern),)
         rules.append(
             MiniAppRuleSpec(
-                id=rule.pk,
-                list_type=rule.list_type,
-                match_type=rule.match_type,
+                id=legacy_rule.pk,
+                list_type=legacy_rule.list_type,
+                match_type=legacy_rule.match_type,
                 value=values[0],
-                bot_id=rule.bot_id,
+                bot_id=legacy_rule.bot_id,
                 values=values,
+                protection_rule_id=legacy_rule.protection_rule_id,
             )
         )
     return rules

@@ -10,6 +10,7 @@ from django.contrib.auth.models import User
 from telethon.tl import functions
 
 from core.models import (
+    ForbiddenRule,
     MiniAppAuditEvent,
     MiniAppPolicy,
     MiniAppRule,
@@ -18,6 +19,7 @@ from core.models import (
 )
 from core.services import telegram_worker as worker
 from core.services.miniapps import create_mini_app_rule
+from core.services.rules import create_rule
 
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.asyncio]
 
@@ -139,6 +141,74 @@ async def test_enforce_reconcile_disables_menu_and_blocks_bot() -> None:
     }
     assert MiniAppAuditEvent.EventType.MENU_DISABLED in event_types
     assert MiniAppAuditEvent.EventType.BOT_BLOCKED in event_types
+
+
+async def test_unified_rule_reconciles_mini_app_and_links_audit() -> None:
+    user = await User.objects.acreate_user(
+        "unified-mini-worker", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+    protection_rule = await worker.sync_to_async(create_rule)(user, "Bad Game")
+    api = MockTelegramApi()
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.client = api
+
+    await runner._reconcile_mini_apps()
+
+    audit = await MiniAppAuditEvent.objects.filter(
+        account=account,
+        event_type=MiniAppAuditEvent.EventType.MENU_DISABLED,
+    ).aget()
+    assert audit.protection_rule_id == protection_rule.pk
+    assert audit.rule_id is None
+    assert audit.result == MiniAppAuditEvent.Result.SUCCEEDED
+
+
+async def test_unified_rule_direction_limits_message_updates() -> None:
+    user = await User.objects.acreate_user(
+        "unified-direction-worker", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+    await worker.sync_to_async(create_rule)(
+        user,
+        "bad_bot",
+        direction=ForbiddenRule.Direction.INCOMING,
+    )
+    api = MockTelegramApi()
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.client = api
+    outgoing = OutgoingEvent("open @bad_bot", outgoing=True)
+    incoming = OutgoingEvent("open @bad_bot", outgoing=False)
+
+    assert not await runner._handle_mini_app_message(
+        outgoing, outgoing.raw_text, is_outgoing=True
+    )
+    assert not outgoing.deleted
+    assert await runner._handle_mini_app_message(
+        incoming, incoming.raw_text, is_outgoing=False
+    )
+    assert incoming.deleted
+
+
+async def test_plain_unified_text_stays_in_regular_message_filter() -> None:
+    user = await User.objects.acreate_user(
+        "unified-plain-worker", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+    await worker.sync_to_async(create_rule)(user, "Bad Game")
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.client = MockTelegramApi()
+    event = OutgoingEvent("Bad Game")
+
+    assert not await runner._handle_mini_app_message(event, event.raw_text)
+    assert not event.deleted
+    assert not await MiniAppAuditEvent.objects.filter(account=account).aexists()
 
 
 async def test_enforce_deletes_outgoing_after_update_and_audits_no_text() -> None:
