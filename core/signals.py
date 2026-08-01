@@ -26,6 +26,10 @@ def _after_commit(callback: Callable[[], None]) -> None:
     callback()
 
 
+def _delete_operator_notification_count() -> None:
+    cache.delete("operator-notifications:v1:open-count")
+
+
 @receiver([post_save, post_delete], sender=FilterEvent)
 def invalidate_filter_event_dashboard(
     sender: type[FilterEvent], instance: FilterEvent, **_kwargs: object
@@ -65,7 +69,7 @@ def invalidate_operator_notification_count(
     **_kwargs: object,
 ) -> None:
     del sender, instance
-    _after_commit(lambda: cache.delete("operator-notifications:v1:open-count"))
+    _after_commit(_delete_operator_notification_count)
 
 
 @receiver(pre_delete, sender=ForbiddenRule)
