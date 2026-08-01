@@ -40,7 +40,7 @@ from core.models import (
     TelegramAccount,
     TelegramAuthFlow,
 )
-from core.services.crypto import decrypt_for_user, encrypt_for_user
+from core.services.crypto import decrypt_for_user, decrypt_many_for_user, encrypt_for_user
 from core.services.dashboard_cache import dashboard_snapshot, invalidate_dashboard
 from core.services.matcher import normalize_text
 from core.services.rules import (
@@ -50,7 +50,7 @@ from core.services.rules import (
     queue_history_scan,
     resolve_rule_change,
     rule_form_initial,
-    rule_label,
+    rule_labels,
     update_rule,
 )
 
@@ -67,15 +67,17 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         "patterns", "dialog_scopes", "history_scans"
     ).all()
     rules_page = Paginator(rules, 20).get_page(request.GET.get("page"))
+    page_rules = list(rules_page.object_list)
+    labels = rule_labels(page_rules, user)
     rule_rows = [
         {
             "rule": rule,
-            "label": rule_label(rule),
+            "label": labels[rule.pk],
             "pattern_count": rule.patterns.count() or 1,
             "scope_count": rule.dialog_scopes.count(),
             "scan": rule.history_scans.first(),
         }
-        for rule in rules_page.object_list
+        for rule in page_rules
     ]
     pending_rule_requests = {
         item.rule_id: item.pk
@@ -384,9 +386,10 @@ def reveal_rule(request: HttpRequest, rule_id: int) -> JsonResponse:
         ForbiddenRule.objects.prefetch_related("patterns"), pk=rule_id, user=user
     )
     patterns = list(rule.patterns.all())
-    phrases = [
-        decrypt_for_user(user, item.encrypted_phrase) for item in patterns
-    ] or [decrypt_for_user(user, rule.encrypted_phrase)]
+    phrases = decrypt_many_for_user(
+        user,
+        [item.encrypted_phrase for item in patterns] or [rule.encrypted_phrase],
+    )
     response = JsonResponse({"phrase": "\n".join(phrases), "phrases": phrases})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -404,9 +407,12 @@ def test_rule(request: HttpRequest, rule_id: int) -> JsonResponse:
         return JsonResponse({"error": "Некорректный тестовый текст."}, status=400)
     patterns = list(rule.patterns.all())
     phrases = [
-        normalize_text(decrypt_for_user(user, item.encrypted_phrase))
-        for item in patterns
-    ] or [normalize_text(decrypt_for_user(user, rule.encrypted_phrase))]
+        normalize_text(value)
+        for value in decrypt_many_for_user(
+            user,
+            [item.encrypted_phrase for item in patterns] or [rule.encrypted_phrase],
+        )
+    ]
     normalized_text = normalize_text(form.cleaned_data["text"])
     matched = any(phrase in normalized_text for phrase in phrases)
     response = JsonResponse({"matched": matched})

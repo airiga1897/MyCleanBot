@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from cryptography.fernet import Fernet, InvalidToken
 from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
 from core.models import ForbiddenRule, MiniAppRule, TelegramDialog
-from core.services.crypto import decrypt_for_user
+from core.services.crypto import DecryptionError, user_fernet
 from core.services.miniapps import normalize_rule_value
 
 
@@ -18,8 +19,15 @@ class InviteRegistrationForm(UserCreationForm):  # type: ignore[type-arg]
 
 
 class TelegramDialogChoiceField(forms.ModelMultipleChoiceField):  # type: ignore[type-arg]
+    _user_cipher: Fernet | None = None
+
     def label_from_instance(self, obj: TelegramDialog) -> str:
-        label = decrypt_for_user(obj.account.user, obj.encrypted_label)
+        if self._user_cipher is None:
+            self._user_cipher = user_fernet(obj.account.user)
+        try:
+            label = self._user_cipher.decrypt(obj.encrypted_label.encode()).decode()
+        except InvalidToken as exc:
+            raise DecryptionError("Unable to decrypt user data") from exc
         return f"{label} · {obj.get_kind_display()}"
 
 
@@ -60,7 +68,7 @@ class RuleForm(forms.Form):
         dialogs_field.queryset = TelegramDialog.objects.filter(
             account__user=user,
             available=True,
-        )
+        ).select_related("account__user")
 
     def clean_phrases(self) -> str:
         phrases = [

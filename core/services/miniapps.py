@@ -9,7 +9,11 @@ from django.db import IntegrityError, transaction
 from django.db.models import Q
 
 from core.models import ForbiddenRule, MiniAppRule, MiniAppRulePattern, TelegramAccount
-from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
+from core.services.crypto import (
+    decrypt_many_for_user,
+    encrypt_for_user,
+    fingerprint,
+)
 from core.services.matcher import normalize_text
 
 MAX_MATCH_TEXT = 2000
@@ -152,19 +156,45 @@ def create_mini_app_rule(
 
 def load_mini_app_rules(account: TelegramAccount) -> list[MiniAppRuleSpec]:
     rules: list[MiniAppRuleSpec] = []
-    protection_rules = (
+    protection_rules = list(
         account.user.forbidden_rules.filter(active=True)
         .prefetch_related("patterns", "dialog_scopes__dialog")
         .order_by("id")
     )
-    for protection_rule in protection_rules:
+    queryset = list(
+        account.mini_app_rules.filter(active=True)
+        .filter(
+            Q(protection_rule__isnull=True)
+            | Q(match_type=MiniAppRule.MatchType.BOT_ID)
+        )
+        .prefetch_related("patterns")
+    )
+    encrypted_groups = [
+        [pattern.encrypted_phrase for pattern in rule.patterns.all()]
+        or [rule.encrypted_phrase]
+        for rule in protection_rules
+    ] + [
+        (
+            []
+            if rule.match_type == MiniAppRule.MatchType.BOT_ID
+            else [pattern.encrypted_pattern for pattern in rule.patterns.all()]
+            or [rule.encrypted_pattern]
+        )
+        for rule in queryset
+    ]
+    decrypted_values = iter(
+        decrypt_many_for_user(
+            account.user,
+            [value for values in encrypted_groups for value in values],
+        )
+    )
+    for protection_rule, encrypted_values in zip(
+        protection_rules,
+        encrypted_groups[: len(protection_rules)],
+        strict=True,
+    ):
         protection_values = tuple(
-            normalize_text(decrypt_for_user(account.user, pattern.encrypted_phrase))
-            for pattern in protection_rule.patterns.all()
-        ) or (
-            normalize_text(
-                decrypt_for_user(account.user, protection_rule.encrypted_phrase)
-            ),
+            normalize_text(next(decrypted_values)) for _value in encrypted_values
         )
         scopes = frozenset(
             scope.dialog.peer_fingerprint
@@ -183,18 +213,13 @@ def load_mini_app_rules(account: TelegramAccount) -> list[MiniAppRuleSpec]:
                 dialog_fingerprints=scopes or None,
             )
         )
-    queryset = account.mini_app_rules.filter(active=True).filter(
-        Q(protection_rule__isnull=True) | Q(match_type=MiniAppRule.MatchType.BOT_ID)
-    ).prefetch_related("patterns")
-    for legacy_rule in queryset:
+    legacy_groups = encrypted_groups[len(protection_rules) :]
+    for legacy_rule, encrypted_values in zip(queryset, legacy_groups, strict=True):
         values: tuple[str, ...]
         if legacy_rule.match_type == MiniAppRule.MatchType.BOT_ID:
             values = (str(legacy_rule.bot_id),)
         else:
-            values = tuple(
-                decrypt_for_user(account.user, pattern.encrypted_pattern)
-                for pattern in legacy_rule.patterns.all()
-            ) or (decrypt_for_user(account.user, legacy_rule.encrypted_pattern),)
+            values = tuple(next(decrypted_values) for _value in encrypted_values)
         rules.append(
             MiniAppRuleSpec(
                 id=legacy_rule.pk,
@@ -211,14 +236,27 @@ def load_mini_app_rules(account: TelegramAccount) -> list[MiniAppRuleSpec]:
 
 def display_mini_app_rules(account: TelegramAccount) -> list[tuple[MiniAppRule, str]]:
     displayed: list[tuple[MiniAppRule, str]] = []
-    for rule in account.mini_app_rules.prefetch_related("patterns").all():
+    rules = list(account.mini_app_rules.prefetch_related("patterns").all())
+    encrypted_groups = [
+        (
+            []
+            if rule.match_type == MiniAppRule.MatchType.BOT_ID
+            else [pattern.encrypted_pattern for pattern in rule.patterns.all()]
+            or [rule.encrypted_pattern]
+        )
+        for rule in rules
+    ]
+    decrypted_values = iter(
+        decrypt_many_for_user(
+            account.user,
+            [value for values in encrypted_groups for value in values],
+        )
+    )
+    for rule, encrypted_values in zip(rules, encrypted_groups, strict=True):
         if rule.match_type == MiniAppRule.MatchType.BOT_ID:
             values = [str(rule.bot_id)]
         else:
-            values = [
-                decrypt_for_user(account.user, pattern.encrypted_pattern)
-                for pattern in rule.patterns.all()
-            ] or [decrypt_for_user(account.user, rule.encrypted_pattern)]
+            values = [next(decrypted_values) for _value in encrypted_values]
         displayed.append((rule, " · ".join(values)))
     return displayed
 
