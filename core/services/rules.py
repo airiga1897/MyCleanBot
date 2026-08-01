@@ -186,10 +186,22 @@ def _apply_payload(rule: ForbiddenRule, data: dict[str, object]) -> ForbiddenRul
         [str(item) for item in cast(list[Any], data["phrases"])]
     )
     first_normalized, first_raw = normalized[0]
+    next_fingerprint = fingerprint(f"{rule.user_id}:{first_normalized}")
+    if (
+        ForbiddenRule.objects.filter(
+            user_id=rule.user_id,
+            phrase_fingerprint=next_fingerprint,
+        )
+        .exclude(pk=rule.pk)
+        .exists()
+    ):
+        raise DuplicateRuleError(
+            "Первая фраза уже используется другим правилом этого пользователя"
+        )
     label = str(data.get("label") or "").strip()
     rule.encrypted_label = encrypt_for_user(rule.user, label) if label else ""
     rule.encrypted_phrase = encrypt_for_user(rule.user, first_raw)
-    rule.phrase_fingerprint = fingerprint(f"{rule.user_id}:{first_normalized}")
+    rule.phrase_fingerprint = next_fingerprint
     rule.direction = str(data["direction"])
     rule.mode = ForbiddenRule.Mode.ENFORCE
     rule.is_locked = True

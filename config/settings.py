@@ -62,10 +62,35 @@ ASGI_APPLICATION = "config.asgi.application"
 DATABASES = {
     "default": dj_database_url.config(
         default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
-        conn_max_age=60,
+        conn_max_age=int(os.getenv("DB_CONN_MAX_AGE", "300")),
         conn_health_checks=True,
     )
 }
+
+CACHE_URL = os.getenv("CACHE_URL", "locmem://mycleanbot")
+if CACHE_URL.startswith("redis://"):
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": CACHE_URL,
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+                "IGNORE_EXCEPTIONS": True,
+            },
+            "KEY_PREFIX": "mycleanbot",
+            "TIMEOUT": int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "15")),
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "mycleanbot-local",
+        }
+    }
+
+SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
+SESSION_CACHE_ALIAS = "default"
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -135,6 +160,16 @@ TELEGRAM_DIALOG_SYNC_SECONDS = int(os.getenv("TELEGRAM_DIALOG_SYNC_SECONDS", "30
 HISTORY_SCAN_BATCH_SIZE = max(1, int(os.getenv("HISTORY_SCAN_BATCH_SIZE", "100")))
 HISTORY_SCAN_YIELD_SECONDS = max(
     0.0, float(os.getenv("HISTORY_SCAN_YIELD_SECONDS", "0.25"))
+)
+DASHBOARD_CACHE_TTL_SECONDS = max(
+    1, int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "15"))
+)
+DASHBOARD_POLL_SECONDS = max(5, int(os.getenv("DASHBOARD_POLL_SECONDS", "15")))
+ACTIVE_SCAN_POLL_SECONDS = max(
+    2, int(os.getenv("ACTIVE_SCAN_POLL_SECONDS", "5"))
+)
+MINI_APP_DISCOVERY_SECONDS = max(
+    300, int(os.getenv("MINI_APP_DISCOVERY_SECONDS", "21600"))
 )
 MAX_TELEGRAM_ACCOUNTS = int(os.getenv("MAX_TELEGRAM_ACCOUNTS", "10"))
 

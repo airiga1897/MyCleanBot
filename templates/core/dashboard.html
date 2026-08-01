@@ -2,7 +2,9 @@
 {% block content %}
 <h1>Личный кабинет</h1>
 
-<section class="card" data-dashboard-status-url="{% url 'dashboard_status' %}">
+<section class="card" data-dashboard-status-url="{% url 'dashboard_status' %}"
+         data-dashboard-poll-seconds="{{ dashboard_poll_seconds }}"
+         data-active-scan-poll-seconds="{{ active_scan_poll_seconds }}">
   <div class="row wrap">
     <div>
       <h2>Telegram</h2>
@@ -118,7 +120,8 @@
 
 <section class="card">
   <h2>Статус ботов и Mini Apps</h2>
-  <p class="muted">Проверяются attachment/side menu, новые сообщения и ссылки, известные диалоги и профили ботов. Уже открытый WebView Telegram закрыть удалённо нельзя.</p>
+  <p class="muted">Проверяются attachment/side menu, недавние и популярные Apps, новые сообщения и ссылки, известные диалоги и профили ботов. При совпадении приложение отключается в меню, связанный бот блокируется, его диалог удаляется.</p>
+  <p class="warning">Ограничение работает средствами официального Telegram API. MyCleanBot не может гарантированно скрыть приложение из глобального поиска, перехватить нажатие прямой ссылки или закрыть уже открытый WebView.</p>
   <div class="stats">
     <div><strong id="mini-stat-total">{{ mini_app_stats.total }}</strong><span>действий за 24 часа</span></div>
     <div><strong id="mini-stat-successful">{{ mini_app_stats.successful }}</strong><span>успешных действий</span></div>
@@ -145,10 +148,10 @@
         <tr>
           <td>{{ event.created_at }}</td>
           <td>{{ event.rule_ids|join:", " }}</td>
-          <td>{{ event.get_direction_display }}</td>
-          <td>{{ event.get_source_display }}</td>
-          <td>{{ event.get_chat_type_display }}</td>
-          <td>{{ event.get_result_display }}</td>
+          <td>{{ event.direction }}</td>
+          <td>{{ event.source }}</td>
+          <td>{{ event.chat_type }}</td>
+          <td>{{ event.result }}</td>
         </tr>
         {% empty %}<tr><td colspan="6">Событий пока нет.</td></tr>{% endfor %}
       </tbody>
@@ -166,10 +169,10 @@
         {% for event in mini_app_events %}
         <tr>
           <td>{{ event.created_at }}</td>
-          <td>{% if event.protection_rule_id %}#{{ event.protection_rule_id }}{% elif event.rule_id %}служебное #{{ event.rule_id }}{% else %}—{% endif %}</td>
-          <td>{{ event.get_event_type_display }}</td>
+          <td>{% if event.rule_id %}#{{ event.rule_id }}{% elif event.legacy_rule_id %}служебное #{{ event.legacy_rule_id }}{% else %}—{% endif %}</td>
+          <td>{{ event.event_type }}</td>
           <td>{% if event.bot_id %}{{ event.bot_id }}{% endif %}{% if event.bot_username %} @{{ event.bot_username }}{% endif %}</td>
-          <td>{{ event.get_result_display }}</td>
+          <td>{{ event.result }}</td>
         </tr>
         {% empty %}<tr><td colspan="5">Событий пока нет.</td></tr>{% endfor %}
       </tbody>

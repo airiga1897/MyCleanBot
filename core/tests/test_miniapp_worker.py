@@ -30,6 +30,7 @@ def mini_app_settings(settings: Any) -> None:
         hashlib.sha256(b"mini-worker-tests").digest()
     ).decode()
     settings.MINI_APP_RECONCILE_SECONDS = 300
+    settings.MINI_APP_DISCOVERY_SECONDS = 21600
 
 
 class MockTelegramApi:
@@ -164,6 +165,56 @@ async def test_unified_rule_reconciles_mini_app_and_links_audit() -> None:
     assert audit.protection_rule_id == protection_rule.pk
     assert audit.rule_id is None
     assert audit.result == MiniAppAuditEvent.Result.SUCCEEDED
+
+
+async def test_main_app_catalog_match_is_enforced_without_opening_webview() -> None:
+    user = await User.objects.acreate_user(
+        "catalog-mini-worker", password="long-password-123"
+    )
+    account = await TelegramAccount.objects.acreate(user=user)
+    rule = await worker.sync_to_async(create_rule)(user, "UHoney")
+    app_bot = SimpleNamespace(
+        id=9090,
+        username="uhoney_bot",
+        first_name="UHoney",
+        last_name="",
+        bot=True,
+        bot_has_main_app=True,
+    )
+
+    class CatalogApi(MockTelegramApi):
+        async def __call__(self, request: Any) -> Any:
+            if isinstance(request, functions.contacts.GetTopPeersRequest):
+                self.requests.append(request)
+                return SimpleNamespace(users=[app_bot])
+            if isinstance(request, functions.bots.GetPopularAppBotsRequest):
+                self.requests.append(request)
+                return SimpleNamespace(users=[])
+            return await super().__call__(request)
+
+    api = CatalogApi()
+    runner = worker.AccountRunner(
+        {"id": account.pk, "user_id": user.pk, "encrypted_session": "unused"}
+    )
+    runner.client = api
+
+    _policy, rules = await worker._load_mini_app_state(account.pk)
+    await runner._maybe_discover_main_apps(rules)
+
+    audit = await MiniAppAuditEvent.objects.filter(
+        account=account,
+        protection_rule=rule,
+        event_type=MiniAppAuditEvent.EventType.APP_DISCOVERED,
+    ).aget()
+    assert audit.bot_id == 9090
+    assert any(
+        isinstance(request, functions.messages.ToggleBotInAttachMenuRequest)
+        for request in api.requests
+    )
+    assert not any(
+        isinstance(request, functions.messages.RequestAppWebViewRequest)
+        for request in api.requests
+    )
 
 
 async def test_unified_rule_direction_limits_message_updates() -> None:

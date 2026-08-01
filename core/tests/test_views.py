@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
 from django.utils import timezone
@@ -22,6 +23,7 @@ from core.models import (
     TelegramAccount,
     TelegramAuthFlow,
 )
+from core.services import dashboard_cache
 from core.services.crypto import decrypt_for_user, encrypt_for_user
 from core.services.miniapps import create_mini_app_rule
 from core.services.rules import create_rule
@@ -254,6 +256,39 @@ def test_dashboard_status_includes_per_rule_history_progress(client: Client) -> 
     assert payload["history_scan"]["id"] == scan.pk
 
 
+def test_dashboard_status_cache_is_reused_and_event_invalidates_it(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache.clear()
+    user = User.objects.create_user("cached-status", password="long-password-123")
+    TelegramAccount.objects.create(user=user)
+    client.force_login(user)
+    calls = 0
+    original = dashboard_cache._filter_events
+
+    def counted(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_cache, "_filter_events", counted)
+
+    assert client.get(reverse("dashboard_status")).status_code == 200
+    assert client.get(reverse("dashboard_status")).status_code == 200
+    assert calls == 1
+
+    FilterEvent.objects.create(
+        user=user,
+        rule_ids=[],
+        direction=FilterEvent.Direction.INCOMING,
+        source="body",
+        chat_type="private",
+        result=FilterEvent.Result.DETECTED,
+    )
+    assert client.get(reverse("dashboard_status")).status_code == 200
+    assert calls == 2
+
+
 def test_disconnect_creates_request_without_disabling_account(client: Client) -> None:
     user = User.objects.create_user("owner", password="long-password-123")
     account = TelegramAccount.objects.create(user=user, desired_enabled=True)
@@ -399,7 +434,8 @@ def test_mini_app_ui_is_isolated_by_telegram_account(client: Client) -> None:
     assert "hidden_bot" not in body
     assert "hidden_audit_bot" not in body
     assert "visible_audit_bot" in body
-    assert "Уже открытый WebView Telegram закрыть удалённо нельзя" in body
+    assert "закрыть уже открытый WebView" in body
+    assert "не может гарантированно скрыть приложение из глобального поиска" in body
 
 
 def test_user_cannot_delete_another_accounts_mini_app_rule(client: Client) -> None:
@@ -770,6 +806,42 @@ def test_operator_resolves_protected_rule_change(
     assert rule.mode == ForbiddenRule.Mode.ENFORCE
     assert rule.is_locked
     assert rule.revision == (2 if decision == "approve" else 1)
+
+
+def test_operator_rule_change_is_idempotent_and_duplicate_is_not_500(
+    client: Client,
+) -> None:
+    operator = User.objects.create_superuser(
+        "safe-change-operator", "safe-change@example.test", "long-password-123"
+    )
+    owner = User.objects.create_user("safe-change-owner", password="long-password-123")
+    TelegramAccount.objects.create(user=owner)
+    create_rule(owner, "занятая фраза")
+    edited = create_rule(owner, ["исходная фраза", "дополнительная"])
+    owner_client = Client()
+    owner_client.force_login(owner)
+    owner_client.post(
+        reverse("edit_rule", kwargs={"rule_id": edited.pk}),
+        {
+            "label": "",
+            "phrases": "занятая фраза",
+            "direction": ForbiddenRule.Direction.BOTH,
+        },
+    )
+    change = RuleChangeRequest.objects.get(rule=edited)
+    client.force_login(operator)
+    url = reverse(
+        "resolve_rule_change_request",
+        kwargs={"request_id": change.pk, "decision": "approve"},
+    )
+
+    assert client.post(url).status_code == 302
+    change.refresh_from_db()
+    assert change.status == RuleChangeRequest.Status.PENDING
+
+    change.status = RuleChangeRequest.Status.APPROVED
+    change.save(update_fields=["status"])
+    assert client.post(url).status_code == 302
 
 
 def test_operator_can_close_one_or_all_visible_notifications(client: Client) -> None:
