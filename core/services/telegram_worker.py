@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -30,6 +31,7 @@ from core.models import (
     WorkerHeartbeat,
 )
 from core.services.crypto import decrypt_for_user, encrypt_for_user, fingerprint
+from core.services.dashboard_cache import invalidate_account_dashboard
 from core.services.matcher import TextCandidate, extract_candidates, find_matches, is_status_command
 from core.services.miniapps import (
     MiniAppRuleDecision,
@@ -90,6 +92,7 @@ def _set_account_state(account_id: int, status: str, error_code: str = "") -> No
         last_error_code=error_code[:64],
         last_heartbeat_at=timezone.now(),
     )
+    invalidate_account_dashboard(account_id)
 
 
 @sync_to_async
@@ -102,6 +105,7 @@ def _clear_account_session(account_id: int) -> None:
         last_error_code="",
         last_heartbeat_at=timezone.now(),
     )
+    invalidate_account_dashboard(account_id)
 
 
 @sync_to_async
@@ -152,6 +156,7 @@ def _record_account_update(account_id: int, direction: str, result: str) -> None
         last_update_direction=direction,
         last_update_result=result[:32],
     )
+    invalidate_account_dashboard(account_id)
 
 
 @sync_to_async
@@ -244,6 +249,11 @@ def _update_history_scan_progress(
         last_error_code=last_error_code[:64],
         updated_at=timezone.now(),
     )
+    account_id = HistoryScan.objects.filter(pk=scan_id).values_list(
+        "account_id", flat=True
+    ).first()
+    if account_id is not None:
+        invalidate_account_dashboard(account_id)
 
 
 @sync_to_async
@@ -263,6 +273,11 @@ def _finish_history_scan(scan_id: int, status: str, error_code: str = "") -> Non
         else None,
         updated_at=timezone.now(),
     )
+    account_id = HistoryScan.objects.filter(pk=scan_id).values_list(
+        "account_id", flat=True
+    ).first()
+    if account_id is not None:
+        invalidate_account_dashboard(account_id)
 
 
 @sync_to_async
@@ -435,6 +450,8 @@ class AccountRunner:
         self.revoke_on_stop = False
         self.mini_app_reconcile_lock = asyncio.Lock()
         self.next_mini_app_reconcile_at = 0.0
+        self.next_mini_app_discovery_at = 0.0
+        self.mini_app_rule_signature = ""
         self.next_dialog_sync_at = 0.0
         self.warned_mini_app_bot_ids: set[int] = set()
         self.history_scan_task: asyncio.Task[None] | None = None
@@ -971,7 +988,85 @@ class AccountRunner:
             if user is not None:
                 await self._disable_mini_app(policy, decision, target, user)
         await self._reconcile_forbidden_dialogs(rules)
+        await self._maybe_discover_main_apps(rules)
         self.warned_mini_app_bot_ids.intersection_update(installed_ids)
+
+    def _mini_app_signature(self, rules: list[MiniAppRuleSpec]) -> str:
+        payload = "\n".join(
+            f"{rule.protection_rule_id or rule.id or 0}:"
+            f"{rule.match_type}:{'|'.join(rule.values or (rule.value,))}"
+            for rule in rules
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def _maybe_discover_main_apps(
+        self, rules: list[MiniAppRuleSpec]
+    ) -> None:
+        if not self.client or not rules:
+            return
+        now = asyncio.get_running_loop().time()
+        signature = self._mini_app_signature(rules)
+        rules_changed = signature != self.mini_app_rule_signature
+        if not rules_changed and now < self.next_mini_app_discovery_at:
+            return
+        self.mini_app_rule_signature = signature
+        self.next_mini_app_discovery_at = now + settings.MINI_APP_DISCOVERY_SECONDS
+
+        discovered: dict[int, Any] = {}
+        requests: list[Any] = [
+            functions.contacts.GetTopPeersRequest(
+                correspondents=False,
+                bots_pm=False,
+                bots_inline=False,
+                phone_calls=False,
+                forward_users=False,
+                forward_chats=False,
+                groups=False,
+                channels=False,
+                bots_app=True,
+                offset=0,
+                limit=100,
+                hash=0,
+            ),
+            functions.bots.GetPopularAppBotsRequest(offset="", limit=100),
+        ]
+        for request in requests:
+            try:
+                response = await self.client(request)
+            except Exception as exc:
+                logger.info(
+                    "mini_app_catalog_query_unavailable account_id=%s method=%s error=%s",
+                    self.account["id"],
+                    request.__class__.__name__,
+                    exc.__class__.__name__,
+                )
+                continue
+            for user in getattr(response, "users", []):
+                if bool(getattr(user, "bot", False)) and bool(
+                    getattr(user, "bot_has_main_app", False)
+                ):
+                    discovered[int(user.id)] = user
+
+        for user in discovered.values():
+            target = MiniAppTarget(
+                bot_id=int(user.id),
+                username=str(getattr(user, "username", "") or "").casefold(),
+                title=" ".join(
+                    item
+                    for item in (
+                        str(getattr(user, "first_name", "") or ""),
+                        str(getattr(user, "last_name", "") or ""),
+                    )
+                    if item
+                ),
+            )
+            decision = decide_mini_app_rule(rules, target)
+            if not decision.denied or not decision.rule:
+                continue
+            await self._record_mini_app_detection(
+                {}, decision, MiniAppAuditEvent.EventType.APP_DISCOVERED, target
+            )
+            await self._disable_mini_app({}, decision, target, user)
 
     async def _reconcile_forbidden_dialogs(
         self, rules: list[MiniAppRuleSpec]

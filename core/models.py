@@ -284,6 +284,9 @@ class FilterEvent(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "-created_at"], name="filter_event_user_time")
+        ]
 
     def __str__(self) -> str:
         return f"Filter event #{self.pk}"
@@ -351,6 +354,9 @@ class HistoryScan(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["account", "-created_at"], name="history_account_time")
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["account"],
@@ -453,6 +459,7 @@ class MiniAppAuditEvent(models.Model):
         OUTGOING_DETECTED = "outgoing_detected", "Исходящее сообщение обнаружено"
         INCOMING_DETECTED = "incoming_detected", "Входящее сообщение обнаружено"
         PROFILE_DETECTED = "profile_detected", "Профиль или диалог обнаружен"
+        APP_DISCOVERED = "app_discovered", "Приложение обнаружено в каталоге Telegram"
         MENU_DISABLED = "menu_disabled", "Mini App отключено в меню"
         BOT_BLOCKED = "bot_blocked", "Бот заблокирован"
         MESSAGE_DELETED = "message_deleted", "Сообщение удалено"

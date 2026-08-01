@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from datetime import timedelta
 from io import BytesIO
 from typing import cast
 
@@ -14,7 +13,6 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import Count, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -32,11 +30,9 @@ from core.forms import (
 )
 from core.models import (
     DisconnectRequest,
-    FilterEvent,
     ForbiddenRule,
     HistoryScan,
     Invitation,
-    MiniAppAuditEvent,
     MiniAppRule,
     OperatorNotification,
     RuleChangeRequest,
@@ -45,6 +41,7 @@ from core.models import (
     TelegramAuthFlow,
 )
 from core.services.crypto import decrypt_for_user, encrypt_for_user
+from core.services.dashboard_cache import dashboard_snapshot, invalidate_dashboard
 from core.services.matcher import normalize_text
 from core.services.rules import (
     DuplicateRuleError,
@@ -88,32 +85,7 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         )
     }
     history_scan = account.history_scans.first()
-    events = user.filter_events.all()[:50]
-    since = timezone.now() - timedelta(hours=24)
-    event_stats = user.filter_events.filter(created_at__gte=since).aggregate(
-        total=Count("id"),
-        successful=Count(
-            "id",
-            filter=Q(
-                result__in=[
-                    FilterEvent.Result.DELETED_SELF,
-                    FilterEvent.Result.DELETED_ALL,
-                    FilterEvent.Result.DELETED,
-                ]
-            ),
-        ),
-        failed=Count("id", filter=Q(result=FilterEvent.Result.FAILED)),
-    )
-    mini_app_events = account.mini_app_events.select_related(
-        "rule", "protection_rule"
-    )[:100]
-    mini_app_stats = account.mini_app_events.filter(created_at__gte=since).aggregate(
-        total=Count("id"),
-        successful=Count(
-            "id", filter=Q(result=MiniAppAuditEvent.Result.SUCCEEDED)
-        ),
-        failed=Count("id", filter=Q(result=MiniAppAuditEvent.Result.FAILED)),
-    )
+    snapshot = dashboard_snapshot(user)
     pending_disconnect = user.disconnect_requests.filter(
         status=DisconnectRequest.Status.PENDING
     ).exists()
@@ -141,11 +113,13 @@ def dashboard(request: HttpRequest) -> HttpResponse:
                     HistoryScan.Status.FAILED,
                 }
             ),
-            "events": events,
-            "event_stats": event_stats,
-            "mini_app_events": mini_app_events,
-            "mini_app_stats": mini_app_stats,
+            "events": snapshot["events"],
+            "event_stats": snapshot["stats"],
+            "mini_app_events": snapshot["mini_app_events"],
+            "mini_app_stats": snapshot["mini_app_stats"],
             "pending_disconnect": pending_disconnect,
+            "dashboard_poll_seconds": settings.DASHBOARD_POLL_SECONDS,
+            "active_scan_poll_seconds": settings.ACTIVE_SCAN_POLL_SECONDS,
         },
     )
 
@@ -153,106 +127,9 @@ def dashboard(request: HttpRequest) -> HttpResponse:
 @login_required
 def dashboard_status(request: HttpRequest) -> JsonResponse:
     user = _authenticated_user(request)
-    account, _ = TelegramAccount.objects.get_or_create(user=user)
-    since = timezone.now() - timedelta(hours=24)
-    events = list(user.filter_events.all()[:50])
-    stats = user.filter_events.filter(created_at__gte=since).aggregate(
-        total=Count("id"),
-        successful=Count(
-            "id",
-            filter=Q(
-                result__in=[
-                    FilterEvent.Result.DELETED_SELF,
-                    FilterEvent.Result.DELETED_ALL,
-                    FilterEvent.Result.DELETED,
-                ]
-            ),
-        ),
-        failed=Count("id", filter=Q(result=FilterEvent.Result.FAILED)),
-    )
-    mini_events = list(
-        account.mini_app_events.select_related("rule", "protection_rule")[:100]
-    )
-    mini_stats = account.mini_app_events.filter(created_at__gte=since).aggregate(
-        total=Count("id"),
-        successful=Count(
-            "id", filter=Q(result=MiniAppAuditEvent.Result.SUCCEEDED)
-        ),
-        failed=Count("id", filter=Q(result=MiniAppAuditEvent.Result.FAILED)),
-    )
-    history_scan = account.history_scans.first()
-    rule_scans: dict[int, HistoryScan] = {}
-    for scan in account.history_scans.filter(rule_id__isnull=False):
-        if scan.rule_id is not None:
-            rule_scans.setdefault(scan.rule_id, scan)
-    return JsonResponse(
-        {
-            "account": {
-                "status": account.get_status_display(),
-                "heartbeat": account.last_heartbeat_at.isoformat()
-                if account.last_heartbeat_at
-                else None,
-                "last_update": account.last_update_at.isoformat()
-                if account.last_update_at
-                else None,
-                "last_update_direction": account.last_update_direction,
-                "last_update_result": account.last_update_result,
-            },
-            "stats": stats,
-            "mini_app_stats": mini_stats,
-            "history_scan": (
-                {
-                    "id": history_scan.pk,
-                    "phase": history_scan.get_phase_display(),
-                    "status": history_scan.get_status_display(),
-                    "status_code": history_scan.status,
-                    "dialogs_scanned": history_scan.dialogs_scanned,
-                    "messages_scanned": history_scan.messages_scanned,
-                    "matches_found": history_scan.matches_found,
-                    "preview_matches": history_scan.preview_matches,
-                    "deleted_self": history_scan.deleted_self,
-                    "skipped_global": history_scan.skipped_global,
-                    "failed_actions": history_scan.failed_actions,
-                }
-                if history_scan
-                else None
-            ),
-            "rule_scans": {
-                str(rule_id): {
-                    "status": scan.get_status_display(),
-                    "status_code": scan.status,
-                    "messages_scanned": scan.messages_scanned,
-                    "matches_found": scan.matches_found,
-                    "deleted_self": scan.deleted_self,
-                    "failed_actions": scan.failed_actions,
-                }
-                for rule_id, scan in rule_scans.items()
-            },
-            "events": [
-                {
-                    "created_at": event.created_at.isoformat(),
-                    "rule_ids": event.rule_ids,
-                    "direction": event.get_direction_display(),
-                    "source": event.get_source_display(),
-                    "chat_type": event.get_chat_type_display(),
-                    "result": event.get_result_display(),
-                }
-                for event in events
-            ],
-            "mini_app_events": [
-                {
-                    "created_at": event.created_at.isoformat(),
-                    "rule_id": event.protection_rule_id,
-                    "legacy_rule_id": event.rule_id,
-                    "event_type": event.get_event_type_display(),
-                    "bot_id": event.bot_id,
-                    "bot_username": event.bot_username,
-                    "result": event.get_result_display(),
-                }
-                for event in mini_events
-            ],
-        }
-    )
+    response = JsonResponse(dashboard_snapshot(user))
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @ratelimit(key="ip", rate="5/h", block=True)
@@ -298,6 +175,7 @@ def add_rule(request: HttpRequest) -> HttpResponse:
         except DuplicateRuleError:
             form.add_error("phrases", "Такое правило уже существует.")
         else:
+            transaction.on_commit(lambda: invalidate_dashboard(user.pk))
             messages.success(request, "Правило добавлено и сразу активно.")
             return redirect("dashboard")
     response = render(
@@ -336,7 +214,13 @@ def edit_rule(request: HttpRequest, rule_id: int) -> HttpResponse:
             )
         except PendingRuleChangeError:
             form.add_error(None, "Сначала отмените или дождитесь решения по текущему запросу.")
+        except DuplicateRuleError:
+            form.add_error(
+                "phrases",
+                "Первая фраза уже используется другим правилом. Объедините фразы в одном правиле.",
+            )
         else:
+            transaction.on_commit(lambda: invalidate_dashboard(user.pk))
             if change:
                 messages.success(
                     request,
@@ -832,20 +716,30 @@ def revoke_invitation(request: HttpRequest, invitation_id: int) -> HttpResponse:
 
 @staff_member_required
 @require_POST
+@transaction.atomic
 def resolve_rule_change_request(
     request: HttpRequest, request_id: int, decision: str
 ) -> HttpResponse:
     change = get_object_or_404(
-        RuleChangeRequest,
-        pk=request_id,
-        status=RuleChangeRequest.Status.PENDING,
+        RuleChangeRequest.objects.select_for_update(), pk=request_id
     )
     if decision not in {"approve", "reject"}:
         raise Http404
-    resolve_rule_change(
-        change, _authenticated_user(request), decision == "approve"
-    )
-    messages.success(request, "Запрос изменения правила обработан.")
+    if change.status != RuleChangeRequest.Status.PENDING:
+        messages.info(request, "Запрос изменения уже обработан.")
+        return redirect("operator_dashboard")
+    try:
+        resolve_rule_change(
+            change, _authenticated_user(request), decision == "approve"
+        )
+    except DuplicateRuleError:
+        messages.error(
+            request,
+            "Изменение не применено: первая фраза уже используется другим правилом пользователя.",
+        )
+    else:
+        transaction.on_commit(lambda: invalidate_dashboard(change.user_id))
+        messages.success(request, "Запрос изменения правила обработан.")
     return redirect("operator_dashboard")
 
 

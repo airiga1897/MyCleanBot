@@ -69,6 +69,16 @@ document.querySelectorAll(".js-test-rule").forEach((form) => {
 
 const statusRoot = document.querySelector("[data-dashboard-status-url]");
 if (statusRoot) {
+  const pollMs = Math.max(
+    5000,
+    Number(statusRoot.dataset.dashboardPollSeconds || 15) * 1000,
+  );
+  const activePollMs = Math.max(
+    2000,
+    Number(statusRoot.dataset.activeScanPollSeconds || 5) * 1000,
+  );
+  let nextPollMs = pollMs;
+  let pollTimer = null;
   const sourceNames = {body: "текст", caption: "подпись", link_target: "ссылка"};
   const chatNames = {
     saved: "Избранное",
@@ -79,12 +89,16 @@ if (statusRoot) {
   };
   const formatTime = (value) => value ? new Date(value).toLocaleString("ru-RU") : "пока нет";
   const updateDashboard = async () => {
+    nextPollMs = pollMs;
     const response = await fetch(statusRoot.dataset.dashboardStatusUrl, {
       credentials: "same-origin",
       cache: "no-store",
     });
     if (!response.ok) return;
     const data = await response.json();
+    if (data.history_scan && ["queued", "running"].includes(data.history_scan.status_code)) {
+      nextPollMs = activePollMs;
+    }
     document.getElementById("account-status").textContent = data.account.status;
     document.getElementById("account-heartbeat").textContent = formatTime(data.account.heartbeat);
     document.getElementById("account-update").textContent = formatTime(data.account.last_update);
@@ -132,21 +146,21 @@ if (statusRoot) {
       const cell = row.insertCell();
       cell.colSpan = 6;
       cell.textContent = "Событий пока нет.";
-      return;
-    }
-    data.events.forEach((item) => {
-      const row = body.insertRow();
-      [
-        formatTime(item.created_at),
-        item.rule_ids.map((id) => `#${id}`).join(", "),
-        item.direction,
-        sourceNames[item.source] || item.source,
-        chatNames[item.chat_type] || item.chat_type,
-        item.result,
-      ].forEach((value) => {
-        row.insertCell().textContent = value;
+    } else {
+      data.events.forEach((item) => {
+        const row = body.insertRow();
+        [
+          formatTime(item.created_at),
+          item.rule_ids.map((id) => `#${id}`).join(", "),
+          item.direction,
+          sourceNames[item.source] || item.source,
+          chatNames[item.chat_type] || item.chat_type,
+          item.result,
+        ].forEach((value) => {
+          row.insertCell().textContent = value;
+        });
       });
-    });
+    }
     const miniBody = document.getElementById("mini-event-table-body");
     miniBody.replaceChildren();
     if (!data.mini_app_events.length) {
@@ -154,18 +168,31 @@ if (statusRoot) {
       const cell = row.insertCell();
       cell.colSpan = 5;
       cell.textContent = "Событий пока нет.";
-      return;
+    } else {
+      data.mini_app_events.forEach((item) => {
+        const row = miniBody.insertRow();
+        const rule = item.rule_id
+          ? `#${item.rule_id}`
+          : (item.legacy_rule_id ? `служебное #${item.legacy_rule_id}` : "—");
+        const bot = [item.bot_id || "", item.bot_username ? `@${item.bot_username}` : ""]
+          .filter(Boolean).join(" ");
+        [formatTime(item.created_at), rule, item.event_type, bot, item.result]
+          .forEach((value) => row.insertCell().textContent = value);
+      });
     }
-    data.mini_app_events.forEach((item) => {
-      const row = miniBody.insertRow();
-      const rule = item.rule_id
-        ? `#${item.rule_id}`
-        : (item.legacy_rule_id ? `служебное #${item.legacy_rule_id}` : "—");
-      const bot = [item.bot_id || "", item.bot_username ? `@${item.bot_username}` : ""]
-        .filter(Boolean).join(" ");
-      [formatTime(item.created_at), rule, item.event_type, bot, item.result]
-        .forEach((value) => row.insertCell().textContent = value);
-    });
   };
-  window.setInterval(updateDashboard, 5000);
+  const scheduleUpdate = (delay = pollMs) => {
+    window.clearTimeout(pollTimer);
+    pollTimer = window.setTimeout(async () => {
+      try {
+        if (!document.hidden) await updateDashboard();
+      } finally {
+        scheduleUpdate(nextPollMs);
+      }
+    }, delay);
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleUpdate(0);
+  });
+  scheduleUpdate();
 }
